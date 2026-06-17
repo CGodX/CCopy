@@ -13,8 +13,6 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ['x86_64-pc-windows-msvc']
 
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked
@@ -35,8 +33,6 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ['aarch64-apple-darwin', 'x86_64-apple-darwin']
 
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked
