@@ -1,0 +1,440 @@
+import { ScrollView } from "std-widgets.slint";
+
+export struct HistoryItem {
+    text: string,
+    detail: string,
+    thumbnail: image,
+    has_thumbnail: bool,
+}
+
+export component MainWindow inherits Window {
+    width: 380px;
+    height: 540px;
+    title: "CCopy";
+    // background: rgba(0,0,0,0);
+    background: #15171d;
+    no-frame: true;
+    always-on-top: true;
+
+    callback hide_requested();
+    callback item_selected(int);
+    callback item_deleted(int);
+    callback search_changed(string);
+    callback category_changed(string);
+    callback selection_changed(int);
+    callback confirm_selection();
+    callback panel_opened();
+    callback drag_started();
+    callback dragged();
+    in-out property <string> search_text;
+    in-out property <string> selected_category;
+    in-out property <int> selected_index;
+    in property <[HistoryItem]> history;
+
+    panel_opened => {
+        search_input.focus();
+    }
+
+    Rectangle {
+        // border-radius: 18px;
+        // background: #15171d;
+
+        FocusScope {
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.hide_requested();
+                    accept
+                } else if (event.text == Key.Return) {
+                    root.confirm_selection();
+                    accept
+                } else if (event.text == Key.DownArrow) {
+                    if root.history.length > 0 {
+                        root.selected_index = min(root.selected_index + 1, root.history.length - 1);
+                        root.selection_changed(root.selected_index);
+                    }
+                    accept
+                } else if (event.text == Key.UpArrow) {
+                    if root.history.length > 0 {
+                        root.selected_index = max(root.selected_index - 1, 0);
+                        root.selection_changed(root.selected_index);
+                    }
+                    accept
+                } else if (event.modifiers.alt && event.text == Key.RightArrow) {
+                    if root.selected_category == "all" {
+                        root.selected_category = "text";
+                    } else if root.selected_category == "text" {
+                        root.selected_category = "image";
+                    } else if root.selected_category == "image" {
+                        root.selected_category = "files";
+                    }
+                    root.category_changed(root.selected_category);
+                    accept
+                } else if (event.modifiers.alt && event.text == Key.LeftArrow) {
+                    if root.selected_category == "files" {
+                        root.selected_category = "image";
+                    } else if root.selected_category == "image" {
+                        root.selected_category = "text";
+                    } else if root.selected_category == "text" {
+                        root.selected_category = "all";
+                    }
+                    root.category_changed(root.selected_category);
+                    accept
+                } else {
+                    reject
+                }
+            }
+        }
+
+        VerticalLayout {
+            padding: 12px;
+            spacing: 16px;
+
+            Rectangle {
+                height: 34px;
+                background: transparent;
+
+                drag_area := TouchArea {
+                    moved => {
+                        if (self.pressed) {
+                            root.dragged();
+                        }
+                    }
+                    pointer-event(event) => {
+                        if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                            root.drag_started();
+                        }
+                    }
+                }
+
+                Text {
+                    x: 0;
+                    text: "CCopy";
+                    color: white;
+                    font-size: 18px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    horizontal-alignment: left;
+                }
+
+                Rectangle {
+                    x: parent.width - 34px;
+                    width: 34px;
+                    height: 34px;
+                    border-radius: 10px;
+                    background: close_area.has-hover ? #3a4152 : transparent;
+
+                    close_area := TouchArea {
+                        clicked => {
+                            root.hide_requested();
+                        }
+                    }
+
+                    Text {
+                        text: "×";
+                        color: #d7dbea;
+                        font-size: 24px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 36px;
+                border-radius: 8px;
+                background: #20242f;
+                border-width: 0;
+
+                search_input := TextInput {
+                    height: 100%;
+                    width: max(parent.width, self.preferred-width) - 40px;
+                    vertical-alignment: center;
+                    text <=> root.search_text;
+                    edited => {
+                        root.search_changed(self.text);
+                    }
+
+                    key-pressed(event) => {
+                        if (event.text == Key.DownArrow) {
+                            if root.history.length > 0 {
+                                root.selected_index = min(root.selected_index + 1, root.history.length - 1);
+                                root.selection_changed(root.selected_index);
+                            }
+                            accept
+                        } else if (event.text == Key.UpArrow) {
+                            if root.history.length > 0 {
+                                root.selected_index = max(root.selected_index - 1, 0);
+                                root.selection_changed(root.selected_index);
+                            }
+                            accept
+                        } else if (event.modifiers.alt && event.text == Key.RightArrow) {
+                            if root.selected_category == "all" {
+                                root.selected_category = "text";
+                            } else if root.selected_category == "text" {
+                                root.selected_category = "image";
+                            } else if root.selected_category == "image" {
+                                root.selected_category = "files";
+                            }
+                            root.category_changed(root.selected_category);
+                            accept
+                        } else if (event.modifiers.alt && event.text == Key.LeftArrow) {
+                            if root.selected_category == "files" {
+                                root.selected_category = "image";
+                            } else if root.selected_category == "image" {
+                                root.selected_category = "text";
+                            } else if root.selected_category == "text" {
+                                root.selected_category = "all";
+                            }
+                            root.category_changed(root.selected_category);
+                            accept
+                        } else if (event.text == Key.Return) {
+                            root.confirm_selection();
+                            accept
+                        } else if (event.text == Key.Escape) {
+                            root.hide_requested();
+                            accept
+                        } else {
+                            reject
+                        }
+                    }
+                }
+
+                Rectangle {
+                    x: parent.width - 24px - 6px;
+                    width: 24px;
+                    height: 24px;
+                    background: clear_text.has-hover ? #3a2a32 : transparent;
+                    border-radius: 12px;
+
+                    clear_text := TouchArea {
+                        clicked => {
+                            root.search_text = "";
+                            root.search_changed("");
+                        }
+                    }
+
+                    Text {
+                        text: "×";
+                        color: clear_text.has-hover ? #ff6b8b : #8a92a3;
+                        font-size: 18px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                height: 30px;
+                spacing: 8px;
+
+                Rectangle {
+                    width: 56px;
+                    height: 30px;
+                    border-radius: 15px;
+                    background: root.selected_category == "all" ? #4d7cff : (all_btn.has-hover ? #2d3342 : #20242f);
+
+                    all_btn := TouchArea {
+                        clicked => {
+                            root.selected_category = "all";
+                            root.category_changed("all");
+                        }
+                    }
+
+                    Text {
+                        text: "全部";
+                        color: root.selected_category == "all" ? white : #c8cfdd;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Rectangle {
+                    width: 56px;
+                    height: 30px;
+                    border-radius: 15px;
+                    background: root.selected_category == "text" ? #4d7cff : (text_btn.has-hover ? #2d3342 : #20242f);
+
+                    text_btn := TouchArea {
+                        clicked => {
+                            root.selected_category = "text";
+                            root.category_changed("text");
+                        }
+                    }
+
+                    Text {
+                        text: "文本";
+                        color: root.selected_category == "text" ? white : #c8cfdd;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Rectangle {
+                    width: 56px;
+                    height: 30px;
+                    border-radius: 15px;
+                    background: root.selected_category == "image" ? #4d7cff : (image_btn.has-hover ? #2d3342 : #20242f);
+
+                    image_btn := TouchArea {
+                        clicked => {
+                            root.selected_category = "image";
+                            root.category_changed("image");
+                        }
+                    }
+
+                    Text {
+                        text: "图片";
+                        color: root.selected_category == "image" ? white : #c8cfdd;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Rectangle {
+                    width: 56px;
+                    height: 30px;
+                    border-radius: 15px;
+                    background: root.selected_category == "files" ? #4d7cff : (files_btn.has-hover ? #2d3342 : #20242f);
+
+                    files_btn := TouchArea {
+                        clicked => {
+                            root.selected_category = "files";
+                            root.category_changed("files");
+                        }
+                    }
+
+                    Text {
+                        text: "文件";
+                        color: root.selected_category == "files" ? white : #c8cfdd;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            if root.history.length == 0: Text {
+                text: "复制一段文本后，按 Alt+V 在这里选择历史记录。";
+                color: #9aa3b8;
+                font-size: 14px;
+                wrap: word-wrap;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+                width: 100%;
+            }
+
+            ScrollView {
+                viewport-width: 356px;
+
+                VerticalLayout {
+                    width: 356px;
+                    spacing: 10px;
+
+                    for item[index] in root.history: Rectangle {
+                        height: 78px;
+                        border-radius: 12px;
+                        touch := TouchArea {
+                            clicked => {
+                                root.item_selected(index);
+                            }
+                        }
+
+                        background: index == root.selected_index ? #36416b :
+                                   (touch.has-hover ? #2d3342 : #20242f);
+
+                        if item.has_thumbnail: Rectangle {
+                            x: 10px;
+                            y: 6px;
+                            width: 66px;
+                            height: 66px;
+                            border-radius: 6px;
+                            clip: true;
+                            background: #20242f;
+
+                            Image {
+                                width: 66px;
+                                height: 66px;
+                                source: item.thumbnail;
+                                image-fit: preserve;
+                            }
+                        }
+
+                        Rectangle {
+                            x: item.has_thumbnail ? 86px : 14px;
+                            y: 6px;
+                            width: parent.width - self.x - 44px;
+                            height: parent.height - 12px;
+
+                            if item.detail == "": Text {
+                                x: 0;
+                                y: 0;
+                                text: item.text;
+                                color: #eef1f8;
+                                font-size: 14px;
+                                horizontal-alignment: left;
+                                vertical-alignment: top;
+                                wrap: char-wrap;
+                                width: 100%;
+                                height: 100%;
+                                overflow: clip;
+                            }
+
+                            if item.detail != "": VerticalLayout {
+                                spacing: 4px;
+
+                                Text {
+                                    text: item.text;
+                                    color: #eef1f8;
+                                    font-size: 14px;
+                                    font-weight: 600;
+                                    horizontal-alignment: left;
+                                    vertical-alignment: top;
+                                    wrap: no-wrap;
+                                    overflow: elide;
+                                }
+
+                                Text {
+                                    text: item.detail;
+                                    color: #9aa3b8;
+                                    font-size: 12px;
+                                    horizontal-alignment: left;
+                                    vertical-alignment: top;
+                                    wrap: char-wrap;
+                                    height: 44px;
+                                    overflow: clip;
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            x: parent.width - 34px;
+                            y: 6px;
+                            width: 24px;
+                            height: 24px;
+                            visible: touch.has-hover || delete_btn.has-hover;
+                            background: delete_btn.has-hover ? #3a2a32 : transparent;
+                            border-radius: 12px;
+
+                            delete_btn := TouchArea {
+                                clicked => {
+                                    root.item_deleted(index);
+                                }
+                            }
+
+                            Text {
+                                text: "×";
+                                color: delete_btn.has-hover ? #ff6b8b : #8a92a3;
+                                font-size: 18px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
