@@ -320,6 +320,18 @@ impl Storage {
 
         Ok(())
     }
+
+    pub fn update_note(&self, id: i64, note: Option<String>) -> rusqlite::Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        self.conn.execute(
+            "UPDATE clipboard_items SET note = ?1, updated_at = ?2 WHERE id = ?3",
+            params![note, now, id],
+        )?;
+        Ok(())
+    }
 }
 
 pub fn data_dir() -> PathBuf {

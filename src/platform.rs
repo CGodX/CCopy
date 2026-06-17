@@ -50,6 +50,7 @@ fn show_panel_at_anchor(app: &MainWindow, anchor: Option<(i32, i32)>) {
     app.set_search_text("".into());
     app.set_selected_category("all".into());
     app.set_selected_index(0);
+    app.set_edit_note_index(-1);
 
     let (x, y) = anchor.unwrap_or((160, 120));
     let (x, y) = clamp_panel_position(app, x + 12, y + 12);

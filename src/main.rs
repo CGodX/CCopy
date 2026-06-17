@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::rc::Rc;
@@ -47,36 +49,13 @@ fn item_to_history_item(item: &ClipboardItem, data_dir: &std::path::Path) -> His
         slint::Image::load_from_path(&thumb_path).ok()
     });
     let has_thumbnail = thumbnail.is_some();
-    let detail = if item.kind == ClipboardKind::Files {
-        file_detail(item)
-    } else {
-        String::new()
-    };
 
     HistoryItem {
         text: SharedString::from(item.preview.as_str()),
-        detail: SharedString::from(detail.as_str()),
+        note: SharedString::from(item.note.as_ref().map(|s| s.as_str()).unwrap_or("")),
         thumbnail: thumbnail.unwrap_or_default(),
         has_thumbnail,
     }
-}
-
-fn file_detail(item: &ClipboardItem) -> String {
-    let mut names = item
-        .files
-        .iter()
-        .take(3)
-        .map(|file| {
-            std::path::Path::new(file.path.as_str())
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| file.path.clone())
-        })
-        .collect::<Vec<_>>();
-    if item.files.len() > names.len() {
-        names.push(format!("等 {} 个文件", item.files.len() - names.len()));
-    }
-    names.join("\n")
 }
 
 fn set_history(
@@ -229,6 +208,51 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let _ = app.hide();
             }
             paste_to_target(paste_target_for_confirm.get());
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let visible_history_for_note = visible_history.clone();
+    let all_history_for_note = history.clone();
+    let history_model_for_note = history_model.clone();
+    let selected_category_for_note = selected_category.clone();
+    let storage_for_note = storage.clone();
+    app.on_edit_note_confirm(move |visible_index, note_text| {
+        let note = if note_text.is_empty() {
+            None
+        } else {
+            Some(note_text.to_string())
+        };
+        let Some(item) = visible_history_for_note.borrow().get(visible_index as usize).cloned() else {
+            return;
+        };
+        if let Some(id) = item.id {
+            if storage_for_note.update_note(id, note).is_ok() {
+                if let Ok(items) = storage_for_note.recent_items(MAX_HISTORY) {
+                    *all_history_for_note.borrow_mut() = items;
+                    let query = app_weak
+                        .upgrade()
+                        .map(|app| app.get_search_text().to_string())
+                        .unwrap_or_default();
+                    apply_filter(
+                        &all_history_for_note,
+                        &visible_history_for_note,
+                        &history_model_for_note,
+                        query.as_str(),
+                        selected_category_for_note.borrow().as_str(),
+                    );
+                }
+            }
+        }
+        if let Some(app) = app_weak.upgrade() {
+            app.set_edit_note_index(-1);
+        }
+    });
+
+    let app_weak = app.as_weak();
+    app.on_edit_note_cancel(move || {
+        if let Some(app) = app_weak.upgrade() {
+            app.set_edit_note_index(-1);
         }
     });
 
@@ -440,7 +464,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 && last_shown.is_some_and(|shown| shown.elapsed() > Duration::from_millis(250))
                 && !is_app_foreground(&app)
             {
-                let _ = app.hide();
+                // let _ = app.hide();
             }
         }
     });
