@@ -1,26 +1,10 @@
 [package]
 name = "ccopy"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
-[package.metadata.packager]
-product-name = "CCopy"
-identifier = "com.ccopy.app"
-before-packaging-command = "cargo build --release"
-
-[package.metadata.packager.windows]
-targets = ["nsis"]
-
-[package.metadata.packager.windows.nsis]
-one-click = false
-allow-change-directory = true
-create-desktop-shortcut = true
-create-start-menu-shortcut = true
-uninstall-display-name = "CCopy"
-include = "packager/nsis-uninstall.nsh"
-
-[package.metadata.packager.macos]
-targets = ["dmg"]
+[profile.dev]
+opt-level = 0
 
 [dependencies]
 chrono = "0.4.45"
