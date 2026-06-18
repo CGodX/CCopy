@@ -245,10 +245,8 @@ app.on_search_changed(move |query| {
             }
             if let Some(target) = paste_target_for_confirm.get() {
                 crate::platform::paste_to_target(PasteTarget::Foreground(target));
-            } else {
-                crate::platform::paste_to_target(PasteTarget::Foreground(unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
-                }));
+            } else if let Some(target) = crate::platform::foreground_window() {
+                crate::platform::paste_to_target(PasteTarget::Foreground(target));
             }
         }
     });
@@ -347,10 +345,8 @@ app.on_search_changed(move |query| {
             }
             if let Some(target) = paste_target_for_select.get() {
                 crate::platform::paste_to_target(PasteTarget::Foreground(target));
-            } else {
-                crate::platform::paste_to_target(PasteTarget::Foreground(unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
-                }));
+            } else if let Some(target) = crate::platform::foreground_window() {
+                crate::platform::paste_to_target(PasteTarget::Foreground(target));
             }
         }
     });

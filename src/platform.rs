@@ -1,4 +1,6 @@
+#[cfg(target_os = "windows")]
 use std::thread;
+#[cfg(target_os = "windows")]
 use std::time::Duration;
 
 use slint::{ComponentHandle, PhysicalPosition};
@@ -271,7 +273,7 @@ fn bring_panel_to_front(app: &MainWindow) {
 fn bring_panel_to_front(_app: &MainWindow) {}
 
 #[cfg(target_os = "windows")]
-fn foreground_window() -> Option<HWND> {
+pub fn foreground_window() -> Option<HWND> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.is_null() {
@@ -283,7 +285,7 @@ fn foreground_window() -> Option<HWND> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn foreground_window() -> Option<()> {
+pub fn foreground_window() -> Option<()> {
     None
 }
 
