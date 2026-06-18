@@ -10,6 +10,11 @@ use global_hotkey::{
 };
 use slint::{Model, Timer, TimerMode, VecModel};
 
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::CreateMutexW;
+
 use crate::clipboard_item::ClipboardItem;
 use crate::filter::{apply_filter, set_history};
 use crate::platform::PasteTarget;
@@ -29,7 +34,52 @@ pub use ui::*;
 
 pub const MAX_HISTORY: usize = 30;
 
+/// 单实例检测：通过命名互斥体保证程序只能运行一个实例
+/// 返回 true 表示这是唯一实例，可以继续运行；返回 false 表示已有实例在运行
+#[cfg(target_os = "windows")]
+fn ensure_single_instance() -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    // 互斥体名称使用应用标识，保证全局唯一
+    let name: Vec<u16> = OsStr::new("CCopy_SingleInstance_Mutex")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        // binitialowner 传 0（FALSE），不主动占有互斥体
+        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if handle.is_null() {
+            // 创建失败，放行让程序继续运行（避免完全无法启动）
+            return true;
+        }
+        // GetLastError 检查是否已存在同名互斥体
+        let err = windows_sys::Win32::Foundation::GetLastError();
+        if err == ERROR_ALREADY_EXISTS as u32 {
+            CloseHandle(handle);
+            return false;
+        }
+        // 互斥体句柄保持不关闭，进程退出时系统自动回收
+        // 使用静态变量持有句柄，防止被优化回收
+        static MUTEX_HANDLE: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
+            std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+        MUTEX_HANDLE.store(handle, std::sync::atomic::Ordering::SeqCst);
+    }
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_single_instance() -> bool {
+    true
+}
+
 fn main() {
+    // 单实例限制：已有实例在运行则直接退出
+    if !ensure_single_instance() {
+        return;
+    }
+
     let app = MainWindow::new().unwrap();
 
     let storage = Rc::new(RefCell::new(Storage::open().unwrap()));
