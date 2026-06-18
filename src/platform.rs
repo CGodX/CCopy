@@ -21,7 +21,7 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW, GetWindowRect,
-            GetWindowThreadProcessId, IsWindow, SetForegroundWindow, SetWindowLongPtrW,
+            GetWindowThreadProcessId, SetForegroundWindow, SetWindowLongPtrW,
             SetWindowPos, GUITHREADINFO, GWLP_HWNDPARENT, GWL_EXSTYLE, HWND_TOPMOST,
             SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WS_EX_APPWINDOW,
             WS_EX_TOOLWINDOW,
@@ -33,6 +33,10 @@ use windows_sys::Win32::{
 pub type ForegroundWindow = HWND;
 #[cfg(not(target_os = "windows"))]
 pub type ForegroundWindow = ();
+
+pub enum PasteTarget {
+    Foreground(ForegroundWindow),
+}
 
 pub fn open_panel_for_target(
     app: &MainWindow,
@@ -46,11 +50,6 @@ pub fn open_panel_for_target(
 
 fn show_panel_at_anchor(app: &MainWindow, anchor: Option<(i32, i32)>) {
     prepare_window(app);
-
-    app.set_search_text("".into());
-    app.set_selected_category("all".into());
-    app.set_selected_index(0);
-    app.set_edit_note_index(-1);
 
     let (x, y) = anchor.unwrap_or((160, 120));
     let (x, y) = clamp_panel_position(app, x + 12, y + 12);
@@ -289,14 +288,16 @@ fn foreground_window() -> Option<()> {
 }
 
 #[cfg(target_os = "windows")]
-pub fn paste_to_target(target: Option<ForegroundWindow>) {
-    let target = target.map(|hwnd| hwnd as isize);
+pub fn paste_to_target(target: PasteTarget) {
+    let hwnd = match target {
+        PasteTarget::Foreground(hwnd) => hwnd,
+    };
+    let hwnd_usize = hwnd as usize;
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(120));
-        if let Some(hwnd) = target {
-            unsafe {
-                SetForegroundWindow(hwnd as HWND);
-            }
+        let hwnd = hwnd_usize as HWND;
+        unsafe {
+            SetForegroundWindow(hwnd);
         }
         thread::sleep(Duration::from_millis(80));
         send_ctrl_v();
@@ -304,7 +305,7 @@ pub fn paste_to_target(target: Option<ForegroundWindow>) {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn paste_to_target(_target: Option<ForegroundWindow>) {}
+pub fn paste_to_target(_target: PasteTarget) {}
 
 #[cfg(target_os = "windows")]
 fn send_ctrl_v() {
@@ -337,21 +338,4 @@ fn keyboard_input(vk: u16, flags: u32) -> INPUT {
             },
         },
     }
-}
-
-#[cfg(target_os = "windows")]
-pub fn is_app_foreground(app: &MainWindow) -> bool {
-    let Some(hwnd) = window_hwnd(app) else {
-        return true;
-    };
-
-    unsafe {
-        let foreground = GetForegroundWindow();
-        foreground == hwnd || foreground.is_null() || IsWindow(foreground) == 0
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn is_app_foreground(_app: &MainWindow) -> bool {
-    true
 }

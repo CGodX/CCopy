@@ -1,6 +1,7 @@
 import { ScrollView } from "std-widgets.slint";
 
 export struct HistoryItem {
+    id: int,
     text: string,
     note: string,
     thumbnail: image,
@@ -21,29 +22,35 @@ export component MainWindow inherits Window {
     callback item_deleted(int);
     callback search_changed(string);
     callback category_changed(string);
-    callback selection_changed(int);
+    callback move_selection(int);
     callback confirm_selection();
     callback panel_opened();
+    callback focus_search();
     callback drag_started();
     callback dragged();
     in-out property <string> search_text;
     in-out property <string> selected_category;
-    in-out property <int> selected_index;
+    in-out property <int> selected_id;
     in property <[HistoryItem]> history;
+    in-out property <length> viewport-y;
+    out property <length> visible-height: history_view.visible-height;
+    out property <length> content-height: history_view.viewport-height;
 
     in-out property <string> edit_note_text;
-    in-out property <int> edit_note_index;
+    in-out property <int> edit_note_id;
+    in-out property <int> edit_note_row_index;
     callback open_edit_note(int);
     callback edit_note_confirm(int, string);
     callback edit_note_cancel();
 
-    panel_opened => {
+    focus_search => {
         search_input.focus();
     }
 
-    open_edit_note(index) => {
-        root.edit_note_index = index;
-        root.edit_note_text = root.history[index].note;
+    open_edit_note(row_index) => {
+        root.edit_note_row_index = row_index;
+        root.edit_note_id = root.history[row_index].id;
+        root.edit_note_text = root.history[row_index].note;
     }
 
     Rectangle {
@@ -60,14 +67,12 @@ export component MainWindow inherits Window {
                     accept
                 } else if (event.text == Key.DownArrow) {
                     if root.history.length > 0 {
-                        root.selected_index = min(root.selected_index + 1, root.history.length - 1);
-                        root.selection_changed(root.selected_index);
+                        root.move_selection(1);
                     }
                     accept
                 } else if (event.text == Key.UpArrow) {
                     if root.history.length > 0 {
-                        root.selected_index = max(root.selected_index - 1, 0);
-                        root.selection_changed(root.selected_index);
+                        root.move_selection(-1);
                     }
                     accept
                 } else if (event.modifiers.alt && event.text == Key.RightArrow) {
@@ -169,14 +174,12 @@ export component MainWindow inherits Window {
                     key-pressed(event) => {
                         if (event.text == Key.DownArrow) {
                             if root.history.length > 0 {
-                                root.selected_index = min(root.selected_index + 1, root.history.length - 1);
-                                root.selection_changed(root.selected_index);
+                                root.move_selection(1);
                             }
                             accept
                         } else if (event.text == Key.UpArrow) {
                             if root.history.length > 0 {
-                                root.selected_index = max(root.selected_index - 1, 0);
-                                root.selection_changed(root.selected_index);
+                                root.move_selection(-1);
                             }
                             accept
                         } else if (event.modifiers.alt && event.text == Key.RightArrow) {
@@ -338,8 +341,9 @@ export component MainWindow inherits Window {
                 width: 100%;
             }
 
-            ScrollView {
+            history_view := ScrollView {
                 viewport-width: 356px;
+                viewport-y <=> root.viewport-y;
 
                 VerticalLayout {
                     width: 356px;
@@ -350,11 +354,11 @@ export component MainWindow inherits Window {
                         border-radius: 12px;
                         touch := TouchArea {
                             clicked => {
-                                root.item_selected(index);
+                                root.item_selected(item.id);
                             }
                         }
 
-                        background: index == root.selected_index ? #36416b : (touch.has-hover ? #2d3342 : #20242f);
+                        background: item.id == root.selected_id ? #36416b : (touch.has-hover ? #2d3342 : #20242f);
 
                         if item.has_thumbnail: Rectangle {
                             x: 10px;
@@ -389,7 +393,7 @@ export component MainWindow inherits Window {
                                     horizontal-alignment: left;
                                     vertical-alignment: top;
                                     wrap: char-wrap;
-                                    height: 44px;
+                                    height: 48px;
                                     overflow: clip;
                                 }
 
@@ -412,7 +416,7 @@ export component MainWindow inherits Window {
                             width: 24px;
                             height: 24px;
                             visible: touch.has-hover || delete_btn.has-hover || note_btn.has-hover;
-                            background: note_btn.has-hover ? #3a4152 : transparent;
+                            background: note_btn.has-hover ? #000 : transparent;
                             border-radius: 12px;
 
                             note_btn := TouchArea {
@@ -436,13 +440,13 @@ export component MainWindow inherits Window {
                             y: 36px;
                             width: 24px;
                             height: 24px;
-                            visible: touch.has-hover || delete_btn.has-hover;
-                            background: delete_btn.has-hover ? #3a4152 : transparent;
+                            visible: touch.has-hover || delete_btn.has-hover || note_btn.has-hover;
+                            background: delete_btn.has-hover ? #000 : transparent;
                             border-radius: 12px;
 
                             delete_btn := TouchArea {
                                 clicked => {
-                                    root.item_deleted(index);
+                                    root.item_deleted(item.id);
                                 }
                             }
 
@@ -462,7 +466,7 @@ export component MainWindow inherits Window {
     }
 
     // Edit note dialog
-    if root.edit_note_index >= 0: Rectangle {
+    if root.edit_note_id >= 0: Rectangle {
         x: 0;
         y: 0;
         width: root.width;
@@ -508,9 +512,13 @@ export component MainWindow inherits Window {
                     vertical-alignment: center;
                     text <=> root.edit_note_text;
 
+                    init => {
+                        self.focus();
+                    }
+
                     key-pressed(event) => {
                         if (event.text == Key.Return) {
-                            root.edit_note_confirm(root.edit_note_index, root.edit_note_text);
+                            root.edit_note_confirm(root.edit_note_id, root.edit_note_text);
                             accept
                         } else if (event.text == Key.Escape) {
                             root.edit_note_cancel();
@@ -555,7 +563,7 @@ export component MainWindow inherits Window {
 
                 confirm_note_btn := TouchArea {
                     clicked => {
-                        root.edit_note_confirm(root.edit_note_index, root.edit_note_text);
+                        root.edit_note_confirm(root.edit_note_id, root.edit_note_text);
                     }
                 }
 

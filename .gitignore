@@ -1,4 +1,5 @@
 /target
+/release
 .claude
 .code-review-graph
 .learnings

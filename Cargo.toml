@@ -1,7 +1,16 @@
 [package]
 name = "ccopy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+
+[package.metadata.packager]
+product-name = "CCopy"
+identifier = "com.ccopy.app"
+before-packaging-command = "cargo build --release"
+formats = ["nsis", "dmg"]
+
+[package.metadata.packager.nsis]
+appdata-paths = ["$APPDATA/CCopy"]
 
 [profile.dev]
 opt-level = 0

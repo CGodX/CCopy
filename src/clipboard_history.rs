@@ -1,9 +1,6 @@
-use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
-use std::hash::{Hash, Hasher};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, TimeZone, Utc};
 use clipboard_rs::{
@@ -11,11 +8,9 @@ use clipboard_rs::{
     ClipboardWatcherContext,
 };
 
-
 use crate::clipboard_item::ClipboardItem;
+use crate::common::*;
 use crate::storage::data_dir;
-
-pub const MAX_HISTORY: usize = 20;
 
 struct ClipboardChangeHandler {
     ctx: ClipboardContext,
@@ -50,17 +45,6 @@ pub fn start_clipboard_watcher(sender: mpsc::Sender<ClipboardItem>) {
         watcher.add_handler(handler);
         watcher.start_watch();
     });
-}
-
-pub fn short_text(text: &str) -> String {
-    // let text = text.replace(['\r', '\n', '\t'], " ");
-    let mut chars = text.chars();
-    let short: String = chars.by_ref().take(300).collect();
-    if chars.next().is_some() {
-        format!("{short}…")
-    } else {
-        short
-    }
 }
 
 fn read_clipboard_item(ctx: &ClipboardContext) -> Option<ClipboardItem> {
@@ -226,22 +210,4 @@ fn read_clipboard_item(ctx: &ClipboardContext) -> Option<ClipboardItem> {
     }
 
     None
-}
-
-pub fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or_default()
-}
-
-fn hash_content(kind: &str, content: &str) -> String {
-    hash_bytes(kind, content.as_bytes())
-}
-
-fn hash_bytes(kind: &str, bytes: &[u8]) -> String {
-    let mut hasher = DefaultHasher::new();
-    kind.hash(&mut hasher);
-    bytes.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
 }

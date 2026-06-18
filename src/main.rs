@@ -1,160 +1,201 @@
 #![windows_subsystem = "windows"]
 
 use std::cell::{Cell, RefCell};
-use std::error::Error;
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
 
-use clipboard_rs::{common::RustImage, Clipboard, ClipboardContext};
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
 };
-use slint::{
-    CloseRequestResponse, ComponentHandle, ModelRc, PhysicalPosition, SharedString, Timer,
-    TimerMode, VecModel,
-};
-use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem},
-    MouseButton, TrayIconBuilder, TrayIconEvent,
-};
+use slint::{Model, Timer, TimerMode, VecModel};
+
+use crate::clipboard_item::ClipboardItem;
+use crate::filter::{apply_filter, set_history};
+use crate::platform::PasteTarget;
+use crate::storage::Storage;
 
 mod clipboard_history;
 mod clipboard_item;
+mod common;
 mod drag;
+mod filter;
 mod platform;
 mod storage;
 mod tray;
+mod ui;
 
-use clipboard_history::{
-    now_millis, start_clipboard_watcher, MAX_HISTORY,
-};
-use clipboard_item::{ClipboardItem, ClipboardKind};
-use drag::{cursor_position, DragState};
-use platform::{is_app_foreground, open_panel_for_target, paste_to_target};
-use storage::Storage;
-use tray::create_tray_icon;
+pub use ui::*;
 
-slint::include_modules!();
+pub const MAX_HISTORY: usize = 30;
 
-fn item_to_history_item(item: &ClipboardItem, data_dir: &std::path::Path) -> HistoryItem {
-    let thumbnail = item.blob_path.as_ref().and_then(|blob_path| {
-        if item.kind != ClipboardKind::Image {
-            return None;
+fn main() {
+    let app = MainWindow::new().unwrap();
+
+    let storage = Rc::new(RefCell::new(Storage::open().unwrap()));
+
+    let history = Rc::new(RefCell::new(Vec::new()));
+    let visible_history = Rc::new(RefCell::new(Vec::new()));
+    let history_model = Rc::new(VecModel::default());
+    app.set_history(history_model.clone().into());
+
+    if let Ok(items) = storage.borrow().recent_items(MAX_HISTORY) {
+        set_history(&history, &history_model, items);
+        apply_filter(&history, &visible_history, &history_model, "", "all");
+    }
+
+    let selected_category = Rc::new(RefCell::new("all".to_string()));
+let selected_id = Rc::new(Cell::new(0));
+let ignore_next_clipboard_change = Rc::new(Cell::new(false));
+let paste_target = Rc::new(Cell::new(None));
+
+app.set_edit_note_id(-1);
+
+fn reset_selected_id(app: &MainWindow, selected_id: &Cell<i32>) {
+    let first = app.get_history().iter().next().map(|i| i.id).unwrap_or(0);
+    selected_id.set(first);
+    app.set_selected_id(first);
+}
+
+reset_selected_id(&app, &selected_id);
+
+let drag_state = Rc::new(RefCell::new(None::<drag::DragState>));
+let app_weak = app.as_weak();
+let drag_state_clone = drag_state.clone();
+app.on_drag_started(move || {
+    if let Some(app) = app_weak.upgrade() {
+        if let Some((cursor_x, cursor_y)) = drag::cursor_position() {
+            let window_position = app.window().position();
+            *drag_state_clone.borrow_mut() = Some(drag::DragState {
+                window_x: window_position.x,
+                window_y: window_position.y,
+                cursor_x,
+                cursor_y,
+            });
         }
-        let full_blob = data_dir.join(blob_path);
-        let file_stem = full_blob.file_stem()?.to_string_lossy();
-        let thumb_path = full_blob.with_file_name(format!("{file_stem}.thumb.png"));
-        slint::Image::load_from_path(&thumb_path).ok()
-    });
-    let has_thumbnail = thumbnail.is_some();
-
-    HistoryItem {
-        text: SharedString::from(item.preview.as_str()),
-        note: SharedString::from(item.note.as_ref().map(|s| s.as_str()).unwrap_or("")),
-        thumbnail: thumbnail.unwrap_or_default(),
-        has_thumbnail,
     }
-}
+});
 
-fn set_history(
-    history: &Rc<RefCell<Vec<ClipboardItem>>>,
-    history_model: &Rc<VecModel<HistoryItem>>,
-    items: Vec<ClipboardItem>,
-) {
-    *history.borrow_mut() = items;
-    refresh_history_model(history, history_model);
-}
-
-fn refresh_history_model(
-    history: &Rc<RefCell<Vec<ClipboardItem>>>,
-    history_model: &Rc<VecModel<HistoryItem>>,
-) {
-    let data_dir = storage::data_dir();
-    history_model.set_vec(
-        history
-            .borrow()
-            .iter()
-            .map(|item| item_to_history_item(item, &data_dir))
-            .collect::<Vec<_>>(),
-    );
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
-    let app = MainWindow::new()?;
-    app.window()
-        .on_close_requested(|| CloseRequestResponse::HideWindow);
-
-    let storage = Rc::new(Storage::open()?);
-    let (clipboard_sender, clipboard_receiver) = mpsc::channel();
-    start_clipboard_watcher(clipboard_sender);
-
-    let history_model = Rc::new(VecModel::from(Vec::<HistoryItem>::new()));
-    let history = Rc::new(RefCell::new(Vec::<ClipboardItem>::new()));
-    let visible_history = Rc::new(RefCell::new(Vec::<ClipboardItem>::new()));
-    let ignore_next_clipboard_change = Rc::new(Cell::new(false));
-    let drag_state = Rc::new(Cell::new(None::<DragState>));
-    let paste_target = Rc::new(Cell::new(None));
-    let selected_category = Rc::new(RefCell::new(String::from("all")));
-    let selected_index = Rc::new(Cell::new(0));
-    app.set_history(ModelRc::from(history_model.clone()));
-    app.set_search_text(String::new().into());
-    app.set_selected_category("all".into());
-    app.set_selected_index(0);
-    if let Ok(items) = storage.recent_items(MAX_HISTORY) {
-        set_history(&history, &history_model, items.clone());
-        *visible_history.borrow_mut() = items;
+let app_weak = app.as_weak();
+let drag_state_weak = drag_state.clone();
+app.on_dragged(move || {
+    if let Some(state) = *drag_state_weak.borrow() {
+        if let Some((cursor_x, cursor_y)) = drag::cursor_position() {
+            let dx = cursor_x - state.cursor_x;
+            let dy = cursor_y - state.cursor_y;
+            if let Some(app) = app_weak.upgrade() {
+                app.window().set_position(slint::PhysicalPosition::new(
+                    state.window_x + dx,
+                    state.window_y + dy,
+                ));
+            }
+        }
     }
+});
 
+    let selected_id_for_open = selected_id.clone();
+    let selected_category_for_open = selected_category.clone();
+    let all_history_for_open = history.clone();
+    let visible_history_for_open = visible_history.clone();
+    let history_model_for_open = history_model.clone();
     let app_weak = app.as_weak();
-    let history_for_search = history.clone();
-    let visible_history_for_search = visible_history.clone();
-    let history_model_for_search = history_model.clone();
-    let category_for_search = selected_category.clone();
-    let selected_index_for_search = selected_index.clone();
-    app.on_search_changed(move |query| {
+    app.on_panel_opened(move || {
+        *selected_category_for_open.borrow_mut() = "all".to_string();
         apply_filter(
-            &history_for_search,
-            &visible_history_for_search,
-            &history_model_for_search,
-            query.as_str(),
-            category_for_search.borrow().as_str(),
+            &all_history_for_open,
+            &visible_history_for_open,
+            &history_model_for_open,
+            "",
+            "all",
         );
-        selected_index_for_search.set(0);
         if let Some(app) = app_weak.upgrade() {
-            app.set_selected_index(0);
+            app.set_search_text(String::new().into());
+            app.set_selected_category("all".into());
+            app.set_edit_note_id(-1);
+            reset_selected_id(&app, &selected_id_for_open);
+            // 延迟触发 focus，等窗口完成系统激活后再设置输入焦点
+            let app_weak = app.as_weak();
+            slint::Timer::single_shot(std::time::Duration::from_millis(50), move || {
+                if let Some(app) = app_weak.upgrade() {
+                    app.invoke_focus_search();
+                }
+            });
         }
     });
 
+let all_history_for_search = history.clone();
+let visible_history_for_search = visible_history.clone();
+let history_model_for_search = history_model.clone();
+let selected_category_for_search = selected_category.clone();
+let selected_id_for_search = selected_id.clone();
+let app_weak = app.as_weak();
+app.on_search_changed(move |query| {
+    apply_filter(
+        &all_history_for_search,
+        &visible_history_for_search,
+        &history_model_for_search,
+        query.as_str(),
+        selected_category_for_search.borrow().as_str(),
+    );
+    if let Some(app) = app_weak.upgrade() {
+        reset_selected_id(&app, &selected_id_for_search);
+    }
+});
+
     let app_weak = app.as_weak();
-    let history_for_category = history.clone();
+    let all_history_for_category = history.clone();
     let visible_history_for_category = visible_history.clone();
     let history_model_for_category = history_model.clone();
+    let selected_id_for_category = selected_id.clone();
     let selected_category_for_category = selected_category.clone();
-    let selected_index_for_category = selected_index.clone();
     app.on_category_changed(move |category| {
         *selected_category_for_category.borrow_mut() = category.to_string();
-        let query = app_weak
-            .upgrade()
-            .map(|app| app.get_search_text().to_string())
-            .unwrap_or_default();
-        apply_filter(
-            &history_for_category,
-            &visible_history_for_category,
-            &history_model_for_category,
-            query.as_str(),
-            selected_category_for_category.borrow().as_str(),
-        );
-        selected_index_for_category.set(0);
         if let Some(app) = app_weak.upgrade() {
-            app.set_selected_index(0);
+            let query = app.get_search_text().to_string();
+            apply_filter(
+                &all_history_for_category,
+                &visible_history_for_category,
+                &history_model_for_category,
+                query.as_str(),
+                category.as_str(),
+            );
+            reset_selected_id(&app, &selected_id_for_category);
         }
     });
 
-    let selected_index_for_selection = selected_index.clone();
-    app.on_selection_changed(move |index| {
-        selected_index_for_selection.set(index);
+    let visible_history_for_move = visible_history.clone();
+    let selected_id_for_move = selected_id.clone();
+    let app_weak = app.as_weak();
+    app.on_move_selection(move |delta| {
+        let visible = visible_history_for_move.borrow();
+        if visible.is_empty() {
+            return;
+        }
+        let pos = visible
+            .iter()
+            .position(|i| i.id == Some(selected_id_for_move.get() as i64))
+            .unwrap_or(0);
+        let next = (pos as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize;
+        let id = visible[next].id.unwrap_or(0) as i32;
+        selected_id_for_move.set(id);
+        if let Some(app) = app_weak.upgrade() {
+            app.set_selected_id(id);
+            const ITEM_H: f32 = 78.0;
+            const SPACING: f32 = 10.0;
+            const STEP: f32 = ITEM_H + SPACING;
+            let item_top = next as f32 * STEP;
+            let item_bottom = item_top + ITEM_H;
+            let visible_h = app.get_visible_height() as f32;
+            let mut vp = app.get_viewport_y() as f32;
+            if item_top < -vp {
+                vp = -item_top;
+            } else if item_bottom > -vp + visible_h {
+                vp = -(item_bottom - visible_h);
+            }
+            let max_vp = app.get_content_height() as f32 - visible_h;
+            let vp = vp.min(0.0).max(-max_vp.max(0.0));
+            app.set_viewport_y(vp);
+        }
     });
 
     let app_weak = app.as_weak();
@@ -162,39 +203,33 @@ fn main() -> Result<(), Box<dyn Error>> {
     let all_history_for_confirm = history.clone();
     let history_model_for_confirm = history_model.clone();
     let selected_category_for_confirm = selected_category.clone();
-    let selected_index_for_confirm = selected_index.clone();
+    let selected_id_for_confirm = selected_id.clone();
     let ignore_for_confirm = ignore_next_clipboard_change.clone();
-    let paste_target_for_confirm = paste_target.clone();
     let storage_for_confirm = storage.clone();
+    let paste_target_for_confirm = paste_target.clone();
     app.on_confirm_selection(move || {
-        let Some(item) = visible_history_for_confirm.borrow().get(selected_index_for_confirm.get() as usize).cloned() else {
+        let Some(item) = visible_history_for_confirm
+            .borrow()
+            .iter()
+            .find(|i| i.id == Some(selected_id_for_confirm.get() as i64))
+            .cloned()
+        else {
             return;
         };
 
         if restore_clipboard_item(&item).is_ok() {
             ignore_for_confirm.set(true);
             if let Some(id) = item.id {
-                let _ = storage_for_confirm.mark_used(id, now_millis());
+                let _ = storage_for_confirm
+                    .borrow_mut()
+                    .mark_used(id, crate::common::now_millis());
             }
-            if let Ok(items) = storage_for_confirm.recent_items(MAX_HISTORY) {
+            if let Ok(items) = storage_for_confirm.borrow().recent_items(MAX_HISTORY) {
                 *all_history_for_confirm.borrow_mut() = items;
-                let query = app_weak
-                    .upgrade()
-                    .map(|app| app.get_search_text().to_string())
-                    .unwrap_or_default();
-                apply_filter(
-                    &all_history_for_confirm,
-                    &visible_history_for_confirm,
-                    &history_model_for_confirm,
-                    query.as_str(),
-                    selected_category_for_confirm.borrow().as_str(),
-                );
                 if let Some(app) = app_weak.upgrade() {
                     app.set_search_text(String::new().into());
                     app.set_selected_category("all".into());
                     *selected_category_for_confirm.borrow_mut() = "all".to_string();
-                    app.set_selected_index(0);
-                    selected_index_for_confirm.set(0);
                     apply_filter(
                         &all_history_for_confirm,
                         &visible_history_for_confirm,
@@ -202,38 +237,39 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "",
                         "all",
                     );
+                    reset_selected_id(&app, &selected_id_for_confirm);
                     let _ = app.hide();
                 }
             } else if let Some(app) = app_weak.upgrade() {
                 let _ = app.hide();
             }
-            paste_to_target(paste_target_for_confirm.get());
+            if let Some(target) = paste_target_for_confirm.get() {
+                crate::platform::paste_to_target(PasteTarget::Foreground(target));
+            } else {
+                crate::platform::paste_to_target(PasteTarget::Foreground(unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
+                }));
+            }
         }
     });
 
     let app_weak = app.as_weak();
-    let visible_history_for_note = visible_history.clone();
     let all_history_for_note = history.clone();
+    let visible_history_for_note = visible_history.clone();
     let history_model_for_note = history_model.clone();
     let selected_category_for_note = selected_category.clone();
     let storage_for_note = storage.clone();
-    app.on_edit_note_confirm(move |visible_index, note_text| {
+    app.on_edit_note_confirm(move |id, note_text| {
         let note = if note_text.is_empty() {
             None
         } else {
             Some(note_text.to_string())
         };
-        let Some(item) = visible_history_for_note.borrow().get(visible_index as usize).cloned() else {
-            return;
-        };
-        if let Some(id) = item.id {
-            if storage_for_note.update_note(id, note).is_ok() {
-                if let Ok(items) = storage_for_note.recent_items(MAX_HISTORY) {
-                    *all_history_for_note.borrow_mut() = items;
-                    let query = app_weak
-                        .upgrade()
-                        .map(|app| app.get_search_text().to_string())
-                        .unwrap_or_default();
+        if storage_for_note.borrow_mut().update_note(id as i64, note).is_ok() {
+            if let Ok(items) = storage_for_note.borrow().recent_items(MAX_HISTORY) {
+                *all_history_for_note.borrow_mut() = items;
+                if let Some(app) = app_weak.upgrade() {
+                    let query = app.get_search_text().to_string();
                     apply_filter(
                         &all_history_for_note,
                         &visible_history_for_note,
@@ -245,14 +281,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         if let Some(app) = app_weak.upgrade() {
-            app.set_edit_note_index(-1);
+            app.set_edit_note_id(-1);
         }
     });
 
     let app_weak = app.as_weak();
     app.on_edit_note_cancel(move || {
         if let Some(app) = app_weak.upgrade() {
-            app.set_edit_note_index(-1);
+            app.set_edit_note_id(-1);
         }
     });
 
@@ -264,31 +300,34 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let app_weak = app.as_weak();
-    let history_for_select = visible_history.clone();
-    let all_history_for_select = history.clone();
     let visible_history_for_select = visible_history.clone();
+    let all_history_for_select = history.clone();
     let history_model_for_select = history_model.clone();
     let selected_category_for_select = selected_category.clone();
+    let selected_id_for_select = selected_id.clone();
     let ignore_for_select = ignore_next_clipboard_change.clone();
-    let paste_target_for_select = paste_target.clone();
     let storage_for_select = storage.clone();
-    app.on_item_selected(move |index| {
-        let Some(item) = history_for_select.borrow().get(index as usize).cloned() else {
+    let paste_target_for_select = paste_target.clone();
+    app.on_item_selected(move |id| {
+        let Some(item) = visible_history_for_select
+            .borrow()
+            .iter()
+            .find(|i| i.id == Some(id as i64))
+            .cloned()
+        else {
             return;
         };
+        selected_id_for_select.set(id);
 
         if restore_clipboard_item(&item).is_ok() {
             ignore_for_select.set(true);
-            if let Some(id) = item.id {
-                let _ = storage_for_select.mark_used(id, now_millis());
+            if let Some(item_id) = item.id {
+                let _ = storage_for_select
+                    .borrow_mut()
+                    .mark_used(item_id, crate::common::now_millis());
             }
-            if let Ok(items) = storage_for_select.recent_items(MAX_HISTORY) {
-                set_history(
-                    &all_history_for_select,
-                    &history_model_for_select,
-                    items.clone(),
-                );
-                *visible_history_for_select.borrow_mut() = items;
+            if let Ok(items) = storage_for_select.borrow().recent_items(MAX_HISTORY) {
+                *all_history_for_select.borrow_mut() = items;
                 if let Some(app) = app_weak.upgrade() {
                     app.set_search_text(String::new().into());
                     app.set_selected_category("all".into());
@@ -300,293 +339,157 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "",
                         "all",
                     );
+                    reset_selected_id(&app, &selected_id_for_select);
                     let _ = app.hide();
                 }
             } else if let Some(app) = app_weak.upgrade() {
                 let _ = app.hide();
             }
-            paste_to_target(paste_target_for_select.get());
+            if let Some(target) = paste_target_for_select.get() {
+                crate::platform::paste_to_target(PasteTarget::Foreground(target));
+            } else {
+                crate::platform::paste_to_target(PasteTarget::Foreground(unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
+                }));
+            }
         }
     });
 
-    let history_for_delete = visible_history.clone();
-    let history_model_for_delete = history_model.clone();
-    let storage_for_delete = storage.clone();
+    let app_weak = app.as_weak();
     let all_history_for_delete = history.clone();
     let visible_history_for_delete = visible_history.clone();
-    let selected_category_for_delete = selected_category.clone();
-    let app_weak = app.as_weak();
-    app.on_item_deleted(move |index| {
-        let Some(item) = history_for_delete.borrow().get(index as usize).cloned() else {
-            return;
-        };
-        if let Some(id) = item.id {
-            if storage_for_delete.delete_item(id).is_ok() {
-                if let Ok(items) = storage_for_delete.recent_items(MAX_HISTORY) {
-                    *all_history_for_delete.borrow_mut() = items;
-                    let query = app_weak
-                        .upgrade()
-                        .map(|app| app.get_search_text().to_string())
-                        .unwrap_or_default();
-                    apply_filter(
-                        &all_history_for_delete,
-                        &visible_history_for_delete,
-                        &history_model_for_delete,
-                        query.as_str(),
-                        selected_category_for_delete.borrow().as_str(),
-                    );
-                }
+    let history_model_for_delete = history_model.clone();
+    let storage_for_delete = storage.clone();
+    app.on_item_deleted(move |id| {
+        let _ = storage_for_delete.borrow_mut().delete_item(id as i64);
+        if let Ok(items) = storage_for_delete.borrow().recent_items(MAX_HISTORY) {
+            *all_history_for_delete.borrow_mut() = items;
+            if let Some(app) = app_weak.upgrade() {
+                let query = app.get_search_text().to_string();
+                let category = app.get_selected_category().to_string();
+                apply_filter(
+                    &all_history_for_delete,
+                    &visible_history_for_delete,
+                    &history_model_for_delete,
+                    query.as_str(),
+                    category.as_str(),
+                );
             }
         }
     });
 
-    let app_weak = app.as_weak();
-    let drag_state_for_start = drag_state.clone();
-    app.on_drag_started(move || {
-        if let (Some(app), Some((cursor_x, cursor_y))) = (app_weak.upgrade(), cursor_position()) {
-            let position = app.window().position();
-            drag_state_for_start.set(Some(DragState {
-                window_x: position.x,
-                window_y: position.y,
-                cursor_x,
-                cursor_y,
-            }));
-        }
-    });
-
-    let app_weak = app.as_weak();
-    let drag_state_for_move = drag_state.clone();
-    app.on_dragged(move || {
-        let (Some(state), Some((cursor_x, cursor_y))) =
-            (drag_state_for_move.get(), cursor_position())
-        else {
-            return;
-        };
-        if let Some(app) = app_weak.upgrade() {
-            app.window().set_position(PhysicalPosition::new(
-                state.window_x + cursor_x - state.cursor_x,
-                state.window_y + cursor_y - state.cursor_y,
-            ));
-        }
-    });
-
-    let exit_item = MenuItem::with_id("exit", "退出", true, None);
-    let menu = Menu::new();
-    menu.append(&exit_item)?;
-
-    let tray_icon = TrayIconBuilder::new()
-        .with_tooltip("CCopy")
-        .with_icon(create_tray_icon()?)
-        .with_menu(Box::new(menu))
-        .with_menu_on_left_click(false)
-        .build()?;
-
-    let hotkey_manager = GlobalHotKeyManager::new()?;
-    let toggle_hotkey = HotKey::new(Some(Modifiers::ALT), Code::KeyV);
-    hotkey_manager.register(toggle_hotkey)?;
-
-    let app_weak = app.as_weak();
-    let history_for_timer = history.clone();
-    let visible_history_for_timer = visible_history.clone();
-    let history_model_for_timer = history_model.clone();
-    let storage_for_timer = storage.clone();
-    let selected_category = selected_category.clone();
-    let selected_index_for_timer = selected_index.clone();
-    let mut last_shown = None;
-    let timer = Timer::default();
-    timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
-        if let Some(app) = app_weak.upgrade() {
-            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                if matches!(
-                    event,
-                    TrayIconEvent::DoubleClick {
-                        button: MouseButton::Left,
-                        ..
-                    }
-                ) {
-                    reset_panel_state(
-                        &history_for_timer,
-                        &visible_history_for_timer,
-                        &history_model_for_timer,
-                        &selected_category,
-                        &selected_index_for_timer,
-                        &storage_for_timer,
-                    );
-                    open_panel_for_target(&app, &paste_target);
-                    last_shown = Some(Instant::now());
+    let (tx, rx) = mpsc::channel();
+    crate::clipboard_history::start_clipboard_watcher(tx);
+    let ignore_next = ignore_next_clipboard_change.clone();
+    let storage_for_cb = storage.clone();
+    let history_for_cb = history.clone();
+    let visible_history_for_cb = visible_history.clone();
+    let history_model_for_cb = history_model.clone();
+    let selected_category_for_cb = selected_category.clone();
+    let app_handle = app.clone_strong();
+    let rx = std::rc::Rc::new(std::cell::RefCell::new(rx));
+    let watcher_timer = slint::Timer::default();
+    watcher_timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(100),
+        move || {
+            let rx = rx.borrow();
+            if let Ok(item) = rx.try_recv() {
+                if ignore_next.get() {
+                    ignore_next.set(false);
+                    return;
                 }
-            }
-
-            while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-                if event.id == toggle_hotkey.id() && event.state == HotKeyState::Pressed {
-                    reset_panel_state(
-                        &history_for_timer,
-                        &visible_history_for_timer,
-                        &history_model_for_timer,
-                        &selected_category,
-                        &selected_index_for_timer,
-                        &storage_for_timer,
-                    );
-                    open_panel_for_target(&app, &paste_target);
-                    last_shown = Some(Instant::now());
-                }
-            }
-
-            while let Ok(item) = clipboard_receiver.try_recv() {
-                if ignore_next_clipboard_change.replace(false) {
-                    continue;
-                }
-                if storage_for_timer.upsert_item(&item).is_ok() {
-                    let _ = storage_for_timer.compact_text_duplicates();
-                    if let Ok(items) = storage_for_timer.recent_items(MAX_HISTORY) {
-                        set_history(&history_for_timer, &history_model_for_timer, items.clone());
-                        *visible_history_for_timer.borrow_mut() = items;
+                let storage = storage_for_cb.borrow_mut();
+                if let Ok(id) = storage.upsert_item(&item) {
+                    let _item = ClipboardItem {
+                        id: Some(id),
+                        ..item
+                    };
+                    if let Ok(items) = storage.recent_items(MAX_HISTORY) {
+                        *history_for_cb.borrow_mut() = items;
+                        let query = app_handle.get_search_text().to_string();
                         apply_filter(
-                            &history_for_timer,
-                            &visible_history_for_timer,
-                            &history_model_for_timer,
-                            app.get_search_text().as_str(),
-                            selected_category.borrow().as_str(),
+                            &history_for_cb,
+                            &visible_history_for_cb,
+                            &history_model_for_cb,
+                            query.as_str(),
+                            selected_category_for_cb.borrow().as_str(),
                         );
-                    } else {
-                        refresh_history_model(&history_for_timer, &history_model_for_timer);
                     }
                 }
             }
+        },
+    );
+    std::mem::forget(watcher_timer);
 
-            while let Ok(event) = MenuEvent::receiver().try_recv() {
-                if event.id == *exit_item.id() {
-                    let _ = slint::quit_event_loop();
+    let app_weak = app.as_weak();
+    app.window().on_close_requested(move || {
+        if let Some(app) = app_weak.upgrade() {
+            let _ = app.hide();
+        }
+        slint::CloseRequestResponse::HideWindow
+    });
+
+    let hotkey_manager = match GlobalHotKeyManager::new() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("注册全局热键失败: {e}");
+            app.run().unwrap();
+            return;
+        }
+    };
+    let toggle_hotkey = HotKey::new(Some(Modifiers::ALT), Code::KeyV);
+    if let Err(e) = hotkey_manager.register(toggle_hotkey) {
+        eprintln!("注册 Alt+V 失败: {e}");
+    }
+
+    let app_weak = app.as_weak();
+    let paste_target_for_hotkey = paste_target.clone();
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, std::time::Duration::from_millis(50), move || {
+        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+            if event.id == toggle_hotkey.id() && event.state == HotKeyState::Pressed {
+                if let Some(app) = app_weak.upgrade() {
+                    crate::platform::open_panel_for_target(&app, &paste_target_for_hotkey);
                 }
-            }
-
-            if app.window().is_visible()
-                && last_shown.is_some_and(|shown| shown.elapsed() > Duration::from_millis(250))
-                && !is_app_foreground(&app)
-            {
-                // let _ = app.hide();
             }
         }
     });
 
-    let _keep_alive = (tray_icon, hotkey_manager, timer, app);
-    slint::run_event_loop_until_quit()?;
-    Ok(())
-}
+    let _tray = tray::create_tray_icon(app.as_weak(), paste_target.clone());
 
-fn reset_panel_state(
-    history: &Rc<RefCell<Vec<ClipboardItem>>>,
-    visible_history: &Rc<RefCell<Vec<ClipboardItem>>>,
-    history_model: &Rc<VecModel<HistoryItem>>,
-    selected_category: &Rc<RefCell<String>>,
-    selected_index: &Rc<Cell<i32>>,
-    storage: &Storage,
-) {
-    *selected_category.borrow_mut() = "all".to_string();
-    selected_index.set(0);
-    if let Ok(items) = storage.recent_items(MAX_HISTORY) {
-        *history.borrow_mut() = items;
-        apply_filter(history, visible_history, history_model, "", "all");
-    }
-}
-
-fn apply_filter(
-    all_history: &Rc<RefCell<Vec<ClipboardItem>>>,
-    visible_history: &Rc<RefCell<Vec<ClipboardItem>>>,
-    history_model: &Rc<VecModel<HistoryItem>>,
-    query: &str,
-    category: &str,
-) {
-    let query = query.trim().to_lowercase();
-    let all_history = all_history.borrow();
-    let filtered: Vec<ClipboardItem> = all_history
-        .iter()
-        .filter(|item| {
-            let matches_category = match category {
-                "all" => true,
-                "text" => matches!(item.kind, ClipboardKind::Text | ClipboardKind::Html | ClipboardKind::Rtf),
-                "image" => matches!(item.kind, ClipboardKind::Image),
-                "files" => matches!(item.kind, ClipboardKind::Files),
-                _ => true,
-            };
-            if !matches_category {
-                return false;
-            }
-            if query.is_empty() {
-                return true;
-            }
-            item.preview.to_lowercase().contains(&query)
-                || item
-                    .plain_text
-                    .as_ref()
-                    .is_some_and(|t| t.to_lowercase().contains(&query))
-                || item
-                    .files
-                    .iter()
-                    .any(|f| f.path.to_lowercase().contains(&query))
-                || item
-                    .note
-                    .as_ref()
-                    .is_some_and(|n| n.to_lowercase().contains(&query))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let data_dir = storage::data_dir();
-    history_model.set_vec(
-        filtered
-            .iter()
-            .map(|item| item_to_history_item(item, &data_dir))
-            .collect::<Vec<_>>(),
-    );
-    *visible_history.borrow_mut() = filtered;
+    let _keep_alive = (hotkey_manager, timer);
+    slint::run_event_loop_until_quit().unwrap();
 }
 
 fn restore_clipboard_item(item: &ClipboardItem) -> clipboard_rs::Result<()> {
-    let ctx = ClipboardContext::new()?;
-    let mut contents = Vec::new();
+    use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
+    let clipboard = ClipboardContext::new()?;
+
     match item.kind {
-        ClipboardKind::Text => {
-            if let Some(text) = &item.text_content {
-                contents.push(clipboard_rs::common::ClipboardContent::Text(text.clone()));
+        crate::clipboard_item::ClipboardKind::Text
+        | crate::clipboard_item::ClipboardKind::Html
+        | crate::clipboard_item::ClipboardKind::Rtf => {
+            if let Some(ref text) = item.plain_text {
+                clipboard.set(vec![ClipboardContent::Text(text.clone())])?;
             }
         }
-        ClipboardKind::Html => {
-            if let Some(html) = &item.text_content {
-                contents.push(clipboard_rs::common::ClipboardContent::Html(html.clone()));
-            }
-            if let Some(text) = &item.plain_text {
-                contents.push(clipboard_rs::common::ClipboardContent::Text(text.clone()));
-            }
-        }
-        ClipboardKind::Rtf => {
-            if let Some(rtf) = &item.text_content {
-                contents.push(clipboard_rs::common::ClipboardContent::Rtf(rtf.clone()));
-            }
-            if let Some(text) = &item.plain_text {
-                contents.push(clipboard_rs::common::ClipboardContent::Text(text.clone()));
-            }
-        }
-        ClipboardKind::Image => {
-            if let Some(blob_path) = &item.blob_path {
-                let data_dir = storage::data_dir();
-                let full_path = data_dir.join(blob_path);
-                if let Ok(image) = clipboard_rs::common::RustImageData::from_path(
-                    full_path.to_string_lossy().as_ref(),
-                ) {
-                    contents.push(clipboard_rs::common::ClipboardContent::Image(image));
+        crate::clipboard_item::ClipboardKind::Image => {
+            if let Some(ref blob) = item.blob_path {
+                let full_path = crate::storage::data_dir().join(blob);
+                if let Ok(data) = std::fs::read(full_path) {
+                    use clipboard_rs::common::{RustImage, RustImageData};
+                    if let Ok(img) = RustImageData::from_bytes(&data) {
+                        clipboard.set(vec![clipboard_rs::ClipboardContent::Image(img)])?;
+                    }
                 }
             }
         }
-        ClipboardKind::Files => {
-            let paths: Vec<String> = item.files.iter().map(|f| f.path.clone()).collect();
-            if !paths.is_empty() {
-                contents.push(clipboard_rs::common::ClipboardContent::Files(paths));
-            }
+        crate::clipboard_item::ClipboardKind::Files => {
+            let files: Vec<String> = item.files.iter().map(|f| f.path.clone()).collect();
+            clipboard.set(vec![ClipboardContent::Files(files)])?;
         }
-        ClipboardKind::Other => {}
-    }
-    if !contents.is_empty() {
-        ctx.set(contents)?;
+        _ => {}
     }
     Ok(())
 }
