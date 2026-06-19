@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 
 use slint::{SharedString, VecModel};
@@ -6,7 +6,8 @@ use slint::{SharedString, VecModel};
 use crate::clipboard_item::ClipboardItem;
 use crate::ui::HistoryItem;
 
-pub fn item_to_history_item(item: &ClipboardItem, data_dir: &std::path::Path) -> HistoryItem {
+/// 把单条 ClipboardItem 转成 Slint HistoryItem，图片类加载缩略图
+pub fn item_to_history_item(item: &ClipboardItem, data_dir: &Path) -> HistoryItem {
     let thumbnail = item.blob_path.as_ref().and_then(|blob_path| {
         if item.kind != crate::clipboard_item::ClipboardKind::Image {
             return None;
@@ -27,77 +28,24 @@ pub fn item_to_history_item(item: &ClipboardItem, data_dir: &std::path::Path) ->
     }
 }
 
-pub fn set_history(
-    history: &Rc<RefCell<Vec<ClipboardItem>>>,
-    history_model: &Rc<VecModel<HistoryItem>>,
-    items: Vec<ClipboardItem>,
-) {
-    *history.borrow_mut() = items;
-    refresh_history_model(history, history_model);
-}
-
-pub fn refresh_history_model(
-    history: &Rc<RefCell<Vec<ClipboardItem>>>,
-    history_model: &Rc<VecModel<HistoryItem>>,
-) {
+/// 用查询结果替换整个 model（重置分页、切换分类/搜索时调用）
+pub fn fill_model(history_model: &Rc<VecModel<HistoryItem>>, items: &[ClipboardItem]) {
     let data_dir = crate::storage::data_dir();
     history_model.set_vec(
-        history
-            .borrow()
+        items
             .iter()
             .map(|item| item_to_history_item(item, &data_dir))
             .collect::<Vec<_>>(),
     );
 }
 
-pub fn apply_filter(
-    all_history: &Rc<RefCell<Vec<ClipboardItem>>>,
-    visible_history: &Rc<RefCell<Vec<ClipboardItem>>>,
-    history_model: &Rc<VecModel<HistoryItem>>,
-    query: &str,
-    category: &str,
-) {
-    let query = query.trim().to_lowercase();
-    let all_history = all_history.borrow();
-    let filtered: Vec<ClipboardItem> = all_history
-        .iter()
-        .filter(|item| {
-            let matches_category = match category {
-                "all" => true,
-                "text" => matches!(
-                    item.kind,
-                    crate::clipboard_item::ClipboardKind::Text
-                        | crate::clipboard_item::ClipboardKind::Html
-                        | crate::clipboard_item::ClipboardKind::Rtf
-                ),
-                "image" => matches!(item.kind, crate::clipboard_item::ClipboardKind::Image),
-                "files" => matches!(item.kind, crate::clipboard_item::ClipboardKind::Files),
-                _ => true,
-            };
-            if !matches_category {
-                return false;
-            }
-            if query.is_empty() {
-                return true;
-            }
-            item.preview.to_lowercase().contains(&query)
-                || item
-                    .plain_text
-                    .as_ref()
-                    .is_some_and(|t| t.to_lowercase().contains(&query))
-                || item
-                    .note
-                    .as_ref()
-                    .is_some_and(|n| n.to_lowercase().contains(&query))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+/// 追加查询结果到 model 末尾（分页加载更多时调用）
+pub fn append_model(history_model: &Rc<VecModel<HistoryItem>>, items: &[ClipboardItem]) {
+    if items.is_empty() {
+        return;
+    }
     let data_dir = crate::storage::data_dir();
-    history_model.set_vec(
-        filtered
-            .iter()
-            .map(|item| item_to_history_item(item, &data_dir))
-            .collect::<Vec<_>>(),
-    );
-    *visible_history.borrow_mut() = filtered;
+    for item in items {
+        history_model.push(item_to_history_item(item, &data_dir));
+    }
 }

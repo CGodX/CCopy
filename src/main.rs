@@ -3,12 +3,10 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::time::Instant;
 
-use global_hotkey::{
-    hotkey::{Code, HotKey, Modifiers},
-    GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
-};
-use slint::{Model, Timer, TimerMode, VecModel};
+use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
+use slint::{ComponentHandle, Model, SharedString, Timer, TimerMode, VecModel};
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS};
@@ -16,23 +14,30 @@ use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 
 use crate::clipboard_item::ClipboardItem;
-use crate::filter::{apply_filter, set_history};
+use crate::filter::{append_model, fill_model};
+use crate::hotkey::HotkeyRegistrar;
 use crate::platform::PasteTarget;
 use crate::storage::Storage;
 
+mod autostart;
 mod clipboard_history;
 mod clipboard_item;
 mod common;
 mod drag;
 mod filter;
+mod hotkey;
 mod platform;
+mod settings;
 mod storage;
 mod tray;
 mod ui;
 
 pub use ui::*;
 
-pub const MAX_HISTORY: usize = 30;
+/// 设置项键名
+pub const SETTING_HOTKEY: &str = "hotkey";
+pub const SETTING_MAX_HISTORY: &str = "max_history";
+pub const SETTING_MAX_AGE_DAYS: &str = "max_age_days";
 
 /// 单实例检测：通过命名互斥体保证程序只能运行一个实例
 /// 返回 true 表示这是唯一实例，可以继续运行；返回 false 表示已有实例在运行
@@ -84,20 +89,39 @@ fn main() {
 
     let storage = Rc::new(RefCell::new(Storage::open().unwrap()));
 
-    let history = Rc::new(RefCell::new(Vec::new()));
-    let visible_history = Rc::new(RefCell::new(Vec::new()));
     let history_model = Rc::new(VecModel::default());
     app.set_history(history_model.clone().into());
 
-    if let Ok(items) = storage.borrow().recent_items(MAX_HISTORY) {
-        set_history(&history, &history_model, items);
-        apply_filter(&history, &visible_history, &history_model, "", "all");
+    // 当前最大历史数（0=不限制），从设置加载，运行时可变更
+    let max_history = Rc::new(Cell::new(settings::load_max_history_value(&storage)));
+    // 当前最大保留天数（0=不限制），从设置加载，运行时可变更
+    let max_age_days = Rc::new(Cell::new(settings::load_max_age_value(&storage)));
+
+    // 分页加载状态：列表与清理规则解耦，列表展示按页加载
+    const PAGE_SIZE: usize = 50;
+    let loaded_count = Rc::new(Cell::new(0usize));
+    let has_more = Rc::new(Cell::new(true));
+    let loading = Rc::new(Cell::new(false));
+    let current_query = Rc::new(RefCell::new(String::new()));
+    let current_category = Rc::new(RefCell::new("all".to_string()));
+
+    // 重载历史（重置分页，查第一页）：用于打开面板、切换分类、搜索、删除等场景
+    let selected_category = Rc::new(RefCell::new("all".to_string()));
+    let selected_id = Rc::new(Cell::new(0));
+
+    // 首次加载第一页
+    {
+        if let Ok(items) = storage.borrow().query_items("", "all", PAGE_SIZE, 0) {
+            fill_model(&history_model, &items);
+            loaded_count.set(items.len());
+            has_more.set(items.len() == PAGE_SIZE);
+        }
     }
 
-    let selected_category = Rc::new(RefCell::new("all".to_string()));
-let selected_id = Rc::new(Cell::new(0));
 let ignore_next_clipboard_change = Rc::new(Cell::new(false));
 let paste_target = Rc::new(Cell::new(None));
+// 面板最近一次显示时间，用于失焦自动隐藏的延迟判断
+let last_shown = Rc::new(Cell::new(None::<Instant>));
 
 app.set_edit_note_id(-1);
 
@@ -108,6 +132,28 @@ fn reset_selected_id(app: &MainWindow, selected_id: &Cell<i32>) {
 }
 
 reset_selected_id(&app, &selected_id);
+
+// 重载历史第一页：重置分页状态，按当前 query/category 查询并填充 model
+let reload_history: Rc<dyn Fn()> = Rc::new({
+    let storage = storage.clone();
+    let history_model = history_model.clone();
+    let loaded_count = loaded_count.clone();
+    let has_more = has_more.clone();
+    let current_query = current_query.clone();
+    let current_category = current_category.clone();
+    move || {
+        let query = current_query.borrow().clone();
+        let category = current_category.borrow().clone();
+        if let Ok(items) = storage
+            .borrow()
+            .query_items(&query, &category, PAGE_SIZE, 0)
+        {
+            fill_model(&history_model, &items);
+            loaded_count.set(items.len());
+            has_more.set(items.len() == PAGE_SIZE);
+        }
+    }
+});
 
 let drag_state = Rc::new(RefCell::new(None::<drag::DragState>));
 let app_weak = app.as_weak();
@@ -145,19 +191,25 @@ app.on_dragged(move || {
 
     let selected_id_for_open = selected_id.clone();
     let selected_category_for_open = selected_category.clone();
-    let all_history_for_open = history.clone();
-    let visible_history_for_open = visible_history.clone();
-    let history_model_for_open = history_model.clone();
+    let reload_for_open = reload_history.clone();
+    let current_query_for_open = current_query.clone();
+    let current_category_for_open = current_category.clone();
+    let last_shown_for_open = last_shown.clone();
+    let storage_for_open = storage.clone();
+    let max_history_for_open = max_history.clone();
+    let max_age_for_open = max_age_days.clone();
     let app_weak = app.as_weak();
     app.on_panel_opened(move || {
+        // 面板打开时按规则清理一次，覆盖「不复制但会看面板」的场景
+        let _ = storage_for_open
+            .borrow()
+            .purge_by_rule(max_history_for_open.get(), max_age_for_open.get());
+        // 重置搜索和分类，重新加载第一页
+        *current_query_for_open.borrow_mut() = String::new();
+        *current_category_for_open.borrow_mut() = "all".to_string();
         *selected_category_for_open.borrow_mut() = "all".to_string();
-        apply_filter(
-            &all_history_for_open,
-            &visible_history_for_open,
-            &history_model_for_open,
-            "",
-            "all",
-        );
+        reload_for_open();
+        last_shown_for_open.set(Some(Instant::now()));
         if let Some(app) = app_weak.upgrade() {
             app.set_search_text(String::new().into());
             app.set_selected_category("all".into());
@@ -173,60 +225,60 @@ app.on_dragged(move || {
         }
     });
 
-let all_history_for_search = history.clone();
-let visible_history_for_search = visible_history.clone();
-let history_model_for_search = history_model.clone();
-let selected_category_for_search = selected_category.clone();
 let selected_id_for_search = selected_id.clone();
+let current_query_for_search = current_query.clone();
+let current_category_for_search = current_category.clone();
+let selected_category_for_search = selected_category.clone();
+let reload_for_search = reload_history.clone();
 let app_weak = app.as_weak();
 app.on_search_changed(move |query| {
-    apply_filter(
-        &all_history_for_search,
-        &visible_history_for_search,
-        &history_model_for_search,
-        query.as_str(),
-        selected_category_for_search.borrow().as_str(),
-    );
+    *current_query_for_search.borrow_mut() = query.to_string();
+    *current_category_for_search.borrow_mut() = selected_category_for_search.borrow().clone();
+    reload_for_search();
     if let Some(app) = app_weak.upgrade() {
         reset_selected_id(&app, &selected_id_for_search);
     }
 });
 
     let app_weak = app.as_weak();
-    let all_history_for_category = history.clone();
-    let visible_history_for_category = visible_history.clone();
-    let history_model_for_category = history_model.clone();
     let selected_id_for_category = selected_id.clone();
     let selected_category_for_category = selected_category.clone();
+    let current_category_for_cat = current_category.clone();
+    let current_query_for_cat = current_query.clone();
+    let reload_for_category = reload_history.clone();
     app.on_category_changed(move |category| {
         *selected_category_for_category.borrow_mut() = category.to_string();
+        *current_category_for_cat.borrow_mut() = category.to_string();
+        let q = if let Some(app) = app_weak.upgrade() {
+            app.get_search_text().to_string()
+        } else {
+            current_query_for_cat.borrow().clone()
+        };
+        *current_query_for_cat.borrow_mut() = q;
+        reload_for_category();
         if let Some(app) = app_weak.upgrade() {
-            let query = app.get_search_text().to_string();
-            apply_filter(
-                &all_history_for_category,
-                &visible_history_for_category,
-                &history_model_for_category,
-                query.as_str(),
-                category.as_str(),
-            );
             reset_selected_id(&app, &selected_id_for_category);
         }
     });
 
-    let visible_history_for_move = visible_history.clone();
+    let history_model_for_move = history_model.clone();
     let selected_id_for_move = selected_id.clone();
     let app_weak = app.as_weak();
     app.on_move_selection(move |delta| {
-        let visible = visible_history_for_move.borrow();
+        // 从已加载的 model 读取可见项做键盘导航
+        let visible: Vec<i32> = history_model_for_move
+            .iter()
+            .map(|i| i.id)
+            .collect();
         if visible.is_empty() {
             return;
         }
         let pos = visible
             .iter()
-            .position(|i| i.id == Some(selected_id_for_move.get() as i64))
+            .position(|id| *id == selected_id_for_move.get())
             .unwrap_or(0);
         let next = (pos as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize;
-        let id = visible[next].id.unwrap_or(0) as i32;
+        let id = visible[next];
         selected_id_for_move.set(id);
         if let Some(app) = app_weak.upgrade() {
             app.set_selected_id(id);
@@ -249,22 +301,22 @@ app.on_search_changed(move |query| {
     });
 
     let app_weak = app.as_weak();
-    let visible_history_for_confirm = visible_history.clone();
-    let all_history_for_confirm = history.clone();
-    let history_model_for_confirm = history_model.clone();
     let selected_category_for_confirm = selected_category.clone();
     let selected_id_for_confirm = selected_id.clone();
     let ignore_for_confirm = ignore_next_clipboard_change.clone();
     let storage_for_confirm = storage.clone();
     let paste_target_for_confirm = paste_target.clone();
+    let reload_for_confirm = reload_history.clone();
+    let current_query_for_confirm = current_query.clone();
+    let current_category_for_confirm = current_category.clone();
     app.on_confirm_selection(move || {
-        let Some(item) = visible_history_for_confirm
+        // 按 id 从库查单条，不再依赖内存 visible 列表
+        let item = match storage_for_confirm
             .borrow()
-            .iter()
-            .find(|i| i.id == Some(selected_id_for_confirm.get() as i64))
-            .cloned()
-        else {
-            return;
+            .get_item(selected_id_for_confirm.get() as i64)
+        {
+            Ok(Some(item)) => item,
+            _ => return,
         };
 
         if restore_clipboard_item(&item).is_ok() {
@@ -274,23 +326,15 @@ app.on_search_changed(move |query| {
                     .borrow_mut()
                     .mark_used(id, crate::common::now_millis());
             }
-            if let Ok(items) = storage_for_confirm.borrow().recent_items(MAX_HISTORY) {
-                *all_history_for_confirm.borrow_mut() = items;
-                if let Some(app) = app_weak.upgrade() {
-                    app.set_search_text(String::new().into());
-                    app.set_selected_category("all".into());
-                    *selected_category_for_confirm.borrow_mut() = "all".to_string();
-                    apply_filter(
-                        &all_history_for_confirm,
-                        &visible_history_for_confirm,
-                        &history_model_for_confirm,
-                        "",
-                        "all",
-                    );
-                    reset_selected_id(&app, &selected_id_for_confirm);
-                    let _ = app.hide();
-                }
-            } else if let Some(app) = app_weak.upgrade() {
+            // 重置搜索和分类，重新加载第一页
+            *current_query_for_confirm.borrow_mut() = String::new();
+            *current_category_for_confirm.borrow_mut() = "all".to_string();
+            *selected_category_for_confirm.borrow_mut() = "all".to_string();
+            reload_for_confirm();
+            if let Some(app) = app_weak.upgrade() {
+                app.set_search_text(String::new().into());
+                app.set_selected_category("all".into());
+                reset_selected_id(&app, &selected_id_for_confirm);
                 let _ = app.hide();
             }
             if let Some(target) = paste_target_for_confirm.get() {
@@ -302,10 +346,7 @@ app.on_search_changed(move |query| {
     });
 
     let app_weak = app.as_weak();
-    let all_history_for_note = history.clone();
-    let visible_history_for_note = visible_history.clone();
     let history_model_for_note = history_model.clone();
-    let selected_category_for_note = selected_category.clone();
     let storage_for_note = storage.clone();
     app.on_edit_note_confirm(move |id, note_text| {
         let note = if note_text.is_empty() {
@@ -314,17 +355,17 @@ app.on_search_changed(move |query| {
             Some(note_text.to_string())
         };
         if storage_for_note.borrow_mut().update_note(id as i64, note).is_ok() {
-            if let Ok(items) = storage_for_note.borrow().recent_items(MAX_HISTORY) {
-                *all_history_for_note.borrow_mut() = items;
-                if let Some(app) = app_weak.upgrade() {
-                    let query = app.get_search_text().to_string();
-                    apply_filter(
-                        &all_history_for_note,
-                        &visible_history_for_note,
-                        &history_model_for_note,
-                        query.as_str(),
-                        selected_category_for_note.borrow().as_str(),
+            // 只更新 model 中对应行的 note 显示，不重置分页
+            let target_id = id;
+            for idx in 0..history_model_for_note.row_count() {
+                let row = history_model_for_note.row_data(idx).unwrap();
+                if row.id == target_id {
+                    let mut new_row = row;
+                    new_row.note = SharedString::from(
+                        note_text.to_string(),
                     );
+                    history_model_for_note.set_row_data(idx, new_row);
+                    break;
                 }
             }
         }
@@ -348,22 +389,19 @@ app.on_search_changed(move |query| {
     });
 
     let app_weak = app.as_weak();
-    let visible_history_for_select = visible_history.clone();
-    let all_history_for_select = history.clone();
-    let history_model_for_select = history_model.clone();
     let selected_category_for_select = selected_category.clone();
     let selected_id_for_select = selected_id.clone();
     let ignore_for_select = ignore_next_clipboard_change.clone();
     let storage_for_select = storage.clone();
     let paste_target_for_select = paste_target.clone();
+    let reload_for_select = reload_history.clone();
+    let current_query_for_select = current_query.clone();
+    let current_category_for_select = current_category.clone();
     app.on_item_selected(move |id| {
-        let Some(item) = visible_history_for_select
-            .borrow()
-            .iter()
-            .find(|i| i.id == Some(id as i64))
-            .cloned()
-        else {
-            return;
+        // 按 id 从库查单条
+        let item = match storage_for_select.borrow().get_item(id as i64) {
+            Ok(Some(item)) => item,
+            _ => return,
         };
         selected_id_for_select.set(id);
 
@@ -374,23 +412,15 @@ app.on_search_changed(move |query| {
                     .borrow_mut()
                     .mark_used(item_id, crate::common::now_millis());
             }
-            if let Ok(items) = storage_for_select.borrow().recent_items(MAX_HISTORY) {
-                *all_history_for_select.borrow_mut() = items;
-                if let Some(app) = app_weak.upgrade() {
-                    app.set_search_text(String::new().into());
-                    app.set_selected_category("all".into());
-                    *selected_category_for_select.borrow_mut() = "all".to_string();
-                    apply_filter(
-                        &all_history_for_select,
-                        &visible_history_for_select,
-                        &history_model_for_select,
-                        "",
-                        "all",
-                    );
-                    reset_selected_id(&app, &selected_id_for_select);
-                    let _ = app.hide();
-                }
-            } else if let Some(app) = app_weak.upgrade() {
+            // 重置搜索和分类，重新加载第一页
+            *current_query_for_select.borrow_mut() = String::new();
+            *current_category_for_select.borrow_mut() = "all".to_string();
+            *selected_category_for_select.borrow_mut() = "all".to_string();
+            reload_for_select();
+            if let Some(app) = app_weak.upgrade() {
+                app.set_search_text(String::new().into());
+                app.set_selected_category("all".into());
+                reset_selected_id(&app, &selected_id_for_select);
                 let _ = app.hide();
             }
             if let Some(target) = paste_target_for_select.get() {
@@ -401,25 +431,20 @@ app.on_search_changed(move |query| {
         }
     });
 
-    let app_weak = app.as_weak();
-    let all_history_for_delete = history.clone();
-    let visible_history_for_delete = visible_history.clone();
     let history_model_for_delete = history_model.clone();
     let storage_for_delete = storage.clone();
+    let loaded_count_for_delete = loaded_count.clone();
     app.on_item_deleted(move |id| {
         let _ = storage_for_delete.borrow_mut().delete_item(id as i64);
-        if let Ok(items) = storage_for_delete.borrow().recent_items(MAX_HISTORY) {
-            *all_history_for_delete.borrow_mut() = items;
-            if let Some(app) = app_weak.upgrade() {
-                let query = app.get_search_text().to_string();
-                let category = app.get_selected_category().to_string();
-                apply_filter(
-                    &all_history_for_delete,
-                    &visible_history_for_delete,
-                    &history_model_for_delete,
-                    query.as_str(),
-                    category.as_str(),
-                );
+        // 从 model 移除对应行，不重置分页
+        for idx in 0..history_model_for_delete.row_count() {
+            if history_model_for_delete.row_data(idx).unwrap().id == id {
+                history_model_for_delete.remove(idx);
+                let cur = loaded_count_for_delete.get();
+                if cur > 0 {
+                    loaded_count_for_delete.set(cur - 1);
+                }
+                break;
             }
         }
     });
@@ -428,11 +453,9 @@ app.on_search_changed(move |query| {
     crate::clipboard_history::start_clipboard_watcher(tx);
     let ignore_next = ignore_next_clipboard_change.clone();
     let storage_for_cb = storage.clone();
-    let history_for_cb = history.clone();
-    let visible_history_for_cb = visible_history.clone();
-    let history_model_for_cb = history_model.clone();
-    let selected_category_for_cb = selected_category.clone();
-    let app_handle = app.clone_strong();
+    let max_history_for_cb = max_history.clone();
+    let max_age_for_cb = max_age_days.clone();
+    let reload_for_cb = reload_history.clone();
     let rx = std::rc::Rc::new(std::cell::RefCell::new(rx));
     let watcher_timer = slint::Timer::default();
     watcher_timer.start(
@@ -445,28 +468,53 @@ app.on_search_changed(move |query| {
                     ignore_next.set(false);
                     return;
                 }
-                let storage = storage_for_cb.borrow_mut();
-                if let Ok(id) = storage.upsert_item(&item) {
-                    let _item = ClipboardItem {
-                        id: Some(id),
-                        ..item
-                    };
-                    if let Ok(items) = storage.recent_items(MAX_HISTORY) {
-                        *history_for_cb.borrow_mut() = items;
-                        let query = app_handle.get_search_text().to_string();
-                        apply_filter(
-                            &history_for_cb,
-                            &visible_history_for_cb,
-                            &history_model_for_cb,
-                            query.as_str(),
-                            selected_category_for_cb.borrow().as_str(),
-                        );
+                // 写入 + 清理在同一个 borrow 内完成，之后释放再 reload
+                let upserted = {
+                    let storage = storage_for_cb.borrow_mut();
+                    let id = storage.upsert_item(&item);
+                    if id.is_ok() {
+                        let _ = storage
+                            .purge_by_rule(max_history_for_cb.get(), max_age_for_cb.get());
                     }
+                    id
+                };
+                if upserted.is_ok() {
+                    // 刷新第一页（新条目排在最前）
+                    reload_for_cb();
                 }
             }
         },
     );
     std::mem::forget(watcher_timer);
+
+    // 滚动到底部加载更多：按当前 query/category 查下一页，追加到 model
+    let storage_for_more = storage.clone();
+    let history_model_for_more = history_model.clone();
+    let loaded_count_for_more = loaded_count.clone();
+    let has_more_for_more = has_more.clone();
+    let loading_for_more = loading.clone();
+    let current_query_for_more = current_query.clone();
+    let current_category_for_more = current_category.clone();
+    app.on_load_more(move || {
+        // 无更多数据或正在加载时跳过，防重复
+        if !has_more_for_more.get() || loading_for_more.get() {
+            return;
+        }
+        loading_for_more.set(true);
+        let query = current_query_for_more.borrow().clone();
+        let category = current_category_for_more.borrow().clone();
+        let offset = loaded_count_for_more.get();
+        if let Ok(items) = storage_for_more
+            .borrow()
+            .query_items(&query, &category, PAGE_SIZE, offset)
+        {
+            append_model(&history_model_for_more, &items);
+            let new_count = offset + items.len();
+            loaded_count_for_more.set(new_count);
+            has_more_for_more.set(items.len() == PAGE_SIZE);
+        }
+        loading_for_more.set(false);
+    });
 
     let app_weak = app.as_weak();
     app.window().on_close_requested(move || {
@@ -476,35 +524,95 @@ app.on_search_changed(move |query| {
         slint::CloseRequestResponse::HideWindow
     });
 
-    let hotkey_manager = match GlobalHotKeyManager::new() {
-        Ok(m) => m,
+    // 热键注册器：从设置加载快捷键规格，支持运行时替换
+    let mut registrar = match HotkeyRegistrar::new() {
+        Ok(r) => r,
         Err(e) => {
-            eprintln!("注册全局热键失败: {e}");
+            eprintln!("创建热键管理器失败: {e}");
             app.run().unwrap();
             return;
         }
     };
-    let toggle_hotkey = HotKey::new(Some(Modifiers::ALT), Code::KeyV);
-    if let Err(e) = hotkey_manager.register(toggle_hotkey) {
-        eprintln!("注册 Alt+V 失败: {e}");
-    }
+    let spec = settings::load_hotkey_spec(&storage);
+    let current_hotkey_id = Rc::new(Cell::new(registrar.register(&spec)));
+    let registrar = Rc::new(RefCell::new(registrar));
 
+    // 设置窗口强引用（保持存活），关闭时置 None
+    let settings_window_ref: Rc<RefCell<Option<SettingsWindow>>> =
+        Rc::new(RefCell::new(None));
+
+    // 打开设置的统一逻辑：主窗口按钮和托盘菜单共用
+    let open_settings_fn: Rc<dyn Fn()> = Rc::new({
+        let storage = storage.clone();
+        let registrar = registrar.clone();
+        let hotkey_id = current_hotkey_id.clone();
+        let settings_ref = settings_window_ref.clone();
+        let selected_id = selected_id.clone();
+        let max_history = max_history.clone();
+        let max_age_days = max_age_days.clone();
+        let reload_history = reload_history.clone();
+        let app_weak = app.as_weak();
+        move || {
+            let app = app_weak.clone();
+            let storage = storage.clone();
+            let registrar = registrar.clone();
+            let hotkey_id = hotkey_id.clone();
+            let settings_ref = settings_ref.clone();
+            let selected_id = selected_id.clone();
+            let max_history = max_history.clone();
+            let max_age_days = max_age_days.clone();
+            let reload_history = reload_history.clone();
+            let storage_for_refresh = storage.clone();
+            let refresh = move || {
+                max_history.set(settings::load_max_history_value(&storage_for_refresh));
+                max_age_days.set(settings::load_max_age_value(&storage_for_refresh));
+                // 清理规则变更后重新加载第一页
+                reload_history();
+                if let Some(app) = app.upgrade() {
+                    reset_selected_id(&app, &selected_id);
+                }
+            };
+            settings::open(storage, registrar, hotkey_id, settings_ref, refresh);
+        }
+    });
+
+    // 主窗口设置按钮
+    let open_for_btn = open_settings_fn.clone();
+    app.on_open_settings(move || open_for_btn());
+
+    // 监听全局热键事件
     let app_weak = app.as_weak();
     let paste_target_for_hotkey = paste_target.clone();
+    let hotkey_id_for_timer = current_hotkey_id.clone();
+    let last_shown_for_timer = last_shown.clone();
     let timer = Timer::default();
     timer.start(TimerMode::Repeated, std::time::Duration::from_millis(50), move || {
+        let Some(expected_id) = hotkey_id_for_timer.get() else {
+            return;
+        };
         while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if event.id == toggle_hotkey.id() && event.state == HotKeyState::Pressed {
+            if event.id == expected_id && event.state == HotKeyState::Pressed {
                 if let Some(app) = app_weak.upgrade() {
                     crate::platform::open_panel_for_target(&app, &paste_target_for_hotkey);
                 }
             }
         }
+        // 窗口失去焦点自动隐藏（显示超过 250ms 且应用不在前台）
+        if let Some(app) = app_weak.upgrade() {
+            if app.window().is_visible()
+                && last_shown_for_timer.get().is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(250))
+                && !crate::platform::is_app_foreground(&app)
+            {
+                let _ = app.hide();
+                last_shown_for_timer.set(None);
+            }
+        }
     });
 
-    let _tray = tray::create_tray_icon(app.as_weak(), paste_target.clone());
+    let open_for_tray = open_settings_fn.clone();
+    let _tray = tray::create_tray_icon(app.as_weak(), paste_target.clone(), Box::new(move || open_for_tray()));
 
-    let _keep_alive = (hotkey_manager, timer);
+    let _keep_alive = (registrar, timer);
     slint::run_event_loop_until_quit().unwrap();
 }
 

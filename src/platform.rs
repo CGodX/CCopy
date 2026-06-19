@@ -23,7 +23,7 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW, GetWindowRect,
-            GetWindowThreadProcessId, SetForegroundWindow, SetWindowLongPtrW,
+            GetWindowThreadProcessId, IsWindow, SetForegroundWindow, SetWindowLongPtrW,
             SetWindowPos, GUITHREADINFO, GWLP_HWNDPARENT, GWL_EXSTYLE, HWND_TOPMOST,
             SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WS_EX_APPWINDOW,
             WS_EX_TOOLWINDOW,
@@ -250,6 +250,19 @@ fn hide_taskbar_icon(app: &MainWindow) {
 
 #[cfg(not(target_os = "windows"))]
 fn hide_taskbar_icon(_app: &MainWindow) {}
+
+#[cfg(target_os = "windows")]
+pub fn is_app_foreground(app: &MainWindow) -> bool {
+    let Some(hwnd) = window_hwnd(app) else {
+        return false;
+    };
+    unsafe { IsWindow(hwnd) != 0 && GetForegroundWindow() == hwnd }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_app_foreground(_app: &MainWindow) -> bool {
+    true
+}
 
 #[cfg(target_os = "windows")]
 fn bring_panel_to_front(app: &MainWindow) {

@@ -1,4 +1,8 @@
 import { ScrollView } from "std-widgets.slint";
+import { SettingsWindow } from "settings.slint";
+
+// 重新导出设置窗口组件，使其在生成代码中可用
+export { SettingsWindow }
 
 export struct HistoryItem {
     id: int,
@@ -26,6 +30,7 @@ export component MainWindow inherits Window {
     callback confirm_selection();
     callback panel_opened();
     callback focus_search();
+    callback load_more();
     callback drag_started();
     callback dragged();
     in-out property <string> search_text;
@@ -43,8 +48,22 @@ export component MainWindow inherits Window {
     callback edit_note_confirm(int, string);
     callback edit_note_cancel();
 
+    // 打开设置面板
+    callback open_settings();
+
     focus_search => {
         search_input.focus();
+    }
+
+    // 滚动到底部检测：定时检查 viewport-y，接近底部触发加载更多
+    load_more_timer := Timer {
+        interval: 200ms;
+        running: root.visible-height > 0 && root.content-height > 0
+            && (-root.viewport-y + root.visible-height >= root.content-height - 200px)
+            && root.content-height > root.visible-height;
+        triggered => {
+            root.load_more();
+        }
     }
 
     open_edit_note(row_index) => {
@@ -56,6 +75,20 @@ export component MainWindow inherits Window {
     Rectangle {
         // border-radius: 18px;
         // background: #15171d;
+
+
+        drag_area := TouchArea {
+            moved => {
+                if (self.pressed) {
+                    root.dragged();
+                }
+            }
+            pointer-event(event) => {
+                if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                    root.drag_started();
+                }
+            }
+        }
 
         FocusScope {
             key-pressed(event) => {
@@ -109,19 +142,6 @@ export component MainWindow inherits Window {
                 height: 34px;
                 background: transparent;
 
-                drag_area := TouchArea {
-                    moved => {
-                        if (self.pressed) {
-                            root.dragged();
-                        }
-                    }
-                    pointer-event(event) => {
-                        if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
-                            root.drag_started();
-                        }
-                    }
-                }
-
                 Text {
                     x: 0;
                     text: "CCopy";
@@ -130,6 +150,29 @@ export component MainWindow inherits Window {
                     font-weight: 700;
                     vertical-alignment: center;
                     horizontal-alignment: left;
+                }
+
+                Rectangle {
+                    x: parent.width - 68px;
+                    width: 34px;
+                    height: 34px;
+                    border-radius: 10px;
+                    background: settings_area.has-hover ? #3a4152 : transparent;
+
+                    settings_area := TouchArea {
+                        clicked => {
+                            root.open_settings();
+                        }
+                    }
+
+                    Image {
+                        x: 10px;
+                        y: 10px;
+                        width: 14px;
+                        height: 14px;
+                        colorize: #d7dbea;
+                        source: @image-url("../../assets/icons/settings.svg");
+                    }
                 }
 
                 Rectangle {
@@ -145,17 +188,18 @@ export component MainWindow inherits Window {
                         }
                     }
 
-                    Text {
-                        text: "×";
-                        color: #d7dbea;
-                        font-size: 24px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+                    Image {
+                        x: 10px;
+                        y: 10px;
+                        width: 14px;
+                        height: 14px;
+                        colorize: #d7dbea;
+                        source: @image-url("../../assets/icons/x.svg");
                     }
                 }
             }
 
-            Rectangle {
+            search_area := Rectangle {
                 height: 36px;
                 border-radius: 8px;
                 background: #20242f;
@@ -218,22 +262,24 @@ export component MainWindow inherits Window {
                     x: parent.width - 24px - 6px;
                     width: 24px;
                     height: 24px;
-                    background: clear_text.has-hover ? #3a2a32 : transparent;
+                    background: search_clear_btn.has-hover ? #3a2a32 : transparent;
                     border-radius: 12px;
+                    visible: search_input.text != "";
 
-                    clear_text := TouchArea {
+                    search_clear_btn := TouchArea {
                         clicked => {
                             root.search_text = "";
                             root.search_changed("");
                         }
                     }
 
-                    Text {
-                        text: "×";
-                        color: clear_text.has-hover ? #ff6b8b : #8a92a3;
-                        font-size: 18px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+                    Image {
+                        x: 6px;
+                        y: 6px;
+                        width: 12px;
+                        height: 12px;
+                        colorize: #d7dbea;
+                        source: @image-url("../../assets/icons/x.svg");
                     }
                 }
             }
@@ -456,7 +502,7 @@ export component MainWindow inherits Window {
                                 width: 14px;
                                 height: 14px;
                                 colorize: #ddd;
-                                source: @image-url("../../assets/icons/x.svg");
+                                source: @image-url("../../assets/icons/trash.svg");
                             }
                         }
                     }

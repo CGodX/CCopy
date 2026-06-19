@@ -1,0 +1,530 @@
+export component SettingsWindow inherits Window {
+    width: 450px;
+    height: 600px;
+    title: "CCopy 设置";
+    background: #20242f;
+    no-frame: true;
+    always-on-top: true;
+
+    // 当前快捷键显示文本
+    in-out property <string> hotkey_display;
+    // 是否正在录制快捷键
+    in-out property <bool> hotkey_recording;
+    // 开机自启开关
+    in-out property <bool> autostart_enabled;
+    // 最大历史数输入（空=不限制）
+    in-out property <string> max_history_input;
+    // 最大保留天数输入（空=不限制）
+    in-out property <string> max_age_input;
+    // 关于：版本号
+    in-out property <string> about_version;
+
+    callback close_requested();
+    callback drag_started();
+    callback dragged();
+    callback start_record();
+    // 录制到按键：key文本 / ctrl / alt / shift
+    callback hotkey_recorded(string, bool, bool, bool);
+    callback toggle_autostart();
+    // 应用自动清理规则（最大记录数 + 最大保留天数）
+    callback apply_cleanup_rules();
+
+    // 二次确认弹层：当前无弹层、待确认清空未标记、待确认清空全部
+    in-out property <string> confirm_kind; // "" / "unnoted" / "all"
+    // 倒计时剩余秒数（>0 时确认按钮禁用）
+    in-out property <int> confirm_countdown;
+    callback confirm_cancel();
+    callback confirm_accept();
+
+    focus_scope := FocusScope {
+        key-pressed(event) => {
+            // 录制中：捕获非纯修饰键，Escape 取消录制
+            if root.hotkey_recording {
+                if event.text == Key.Escape {
+                    root.hotkey_recording = false;
+                    accept
+                } else if event.text == Key.Control || event.text == Key.Alt || event.text == Key.Shift || event.text == Key.Meta {
+                    reject
+                } else {
+                    root.hotkey_recorded(
+                        event.text,
+                        event.modifiers.control,
+                        event.modifiers.alt,
+                        event.modifiers.shift,
+                    );
+                    accept
+                }
+            } else if event.text == Key.Escape {
+                root.close_requested();
+                accept
+            } else {
+                reject
+            }
+        }
+        Rectangle {
+            drag_area := TouchArea {
+                moved => {
+                    if (self.pressed) {
+                        root.dragged();
+                    }
+                }
+                pointer-event(event) => {
+                    if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                        root.drag_started();
+                    }
+                }
+            }
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 16px;
+
+                // 标题栏（可拖拽）
+                Rectangle {
+                    height: 34px;
+
+                    Text {
+                        x: 0;
+                        text: "设置";
+                        color: #eef1f8;
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        x: parent.width - 34px;
+                        width: 34px;
+                        height: 34px;
+                        border-radius: 10px;
+                        background: settings_close.has-hover ? #3a4152 : transparent;
+
+                        settings_close := TouchArea {
+                            clicked => {
+                                root.close_requested();
+                            }
+                        }
+
+                        Image {
+                            x: 10px;
+                            y: 10px;
+                            width: 14px;
+                            height: 14px;
+                            colorize: #d7dbea;
+                            source: @image-url("../../assets/icons/x.svg");
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 16px;
+                    alignment: start;
+
+                    // 快捷键
+                    VerticalLayout {
+                        spacing: 8px;
+
+                        Text {
+                            text: "唤起快捷键";
+                            color: #c8cfdd;
+                            font-size: 13px;
+                        }
+
+                        Rectangle {
+                            height: 36px;
+                            border-radius: 8px;
+                            background: #15171d;
+
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 8px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: root.hotkey_recording ? "按下新的快捷键…" : root.hotkey_display;
+                                    color: root.hotkey_recording ? #4d7cff : #eef1f8;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: left;
+                                }
+
+                                Rectangle {
+                                    width: 64px;
+                                    height: 28px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 6px;
+                                    background: record_btn.has-hover ? #3a4152 : #2d3342;
+
+                                    record_btn := TouchArea {
+                                        clicked => {
+                                            root.start_record();
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "录制";
+                                        color: #c8cfdd;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 开机自启
+                    HorizontalLayout {
+                        height: 28px;
+                        spacing: 8px;
+
+                        Text {
+                            text: "开机自启动";
+                            color: #c8cfdd;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                        }
+
+                        Rectangle {
+                            width: 44px;
+                            height: 24px;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: 12px;
+                            background: root.autostart_enabled ? #4d7cff : #3a4152;
+
+                            autostart_toggle := TouchArea {
+                                clicked => {
+                                    root.toggle_autostart();
+                                }
+                            }
+
+                            Rectangle {
+                                x: root.autostart_enabled ? (parent.width - self.width - 3px) : 3px;
+                                y: 3px;
+                                width: 18px;
+                                height: 18px;
+                                border-radius: 9px;
+                                background: white;
+                            }
+                        }
+                    }
+
+                    // 自动清理规则
+                    VerticalLayout {
+                        spacing: 8px;
+
+                        Text {
+                            text: "自动清理规则";
+                            color: #c8cfdd;
+                            font-size: 13px;
+                        }
+
+                        Text {
+                            text: "留空 = 不限制 · 添加备注的记录不会被自动清理";
+                            color: #6b7488;
+                            font-size: 11px;
+                        }
+
+                        // 最大记录数
+                        HorizontalLayout {
+                            spacing: 8px;
+
+                            Text {
+                                text: "最大记录数";
+                                color: #9aa3b8;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                width: 80px;
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: 34px;
+                                border-radius: 8px;
+                                background: #15171d;
+
+                                TextInput {
+                                    x: 12px;
+                                    width: parent.width - 24px;
+                                    height: 100%;
+                                    vertical-alignment: center;
+                                    text <=> root.max_history_input;
+                                    color: #eef1f8;
+                                    font-size: 13px;
+                                    input-type: number;
+
+                                    key-pressed(event) => {
+                                        if event.text == Key.Return {
+                                            root.apply_cleanup_rules();
+                                            accept
+                                        } else {
+                                            reject
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 最大保留天数
+                        HorizontalLayout {
+                            spacing: 8px;
+
+                            Text {
+                                text: "保留天数";
+                                color: #9aa3b8;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                width: 80px;
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: 34px;
+                                border-radius: 8px;
+                                background: #15171d;
+
+                                TextInput {
+                                    x: 12px;
+                                    width: parent.width - 24px;
+                                    height: 100%;
+                                    vertical-alignment: center;
+                                    text <=> root.max_age_input;
+                                    color: #eef1f8;
+                                    font-size: 13px;
+                                    input-type: number;
+
+                                    key-pressed(event) => {
+                                        if event.text == Key.Return {
+                                            root.apply_cleanup_rules();
+                                            accept
+                                        } else {
+                                            reject
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+
+                        // 应用按钮（右对齐）
+                        HorizontalLayout {
+                            alignment: end;
+
+                            Rectangle {
+                                width: 80px;
+                                height: 30px;
+                                border-radius: 6px;
+                                background: apply_rules_btn.has-hover ? #3a4152 : #2d3342;
+
+                                apply_rules_btn := TouchArea {
+                                    clicked => {
+                                        root.apply_cleanup_rules();
+                                    }
+                                }
+
+                                Text {
+                                    text: "应用";
+                                    color: #c8cfdd;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    // 手动清理
+                    VerticalLayout {
+                        spacing: 8px;
+
+                        Text {
+                            text: "手动清理";
+                            color: #c8cfdd;
+                            font-size: 13px;
+                        }
+
+                        // 清空未标记记录（灰底，次级）
+                        Rectangle {
+                            height: 34px;
+                            border-radius: 8px;
+                            background: clear_unnoted_btn.has-hover ? #3a4152 : #2d3342;
+
+                            clear_unnoted_btn := TouchArea {
+                                clicked => {
+                                    root.confirm_kind = "unnoted";
+                                    root.confirm_countdown = 2;
+                                }
+                            }
+
+                            Text {
+                                text: "清空未标记记录";
+                                color: #c8cfdd;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        // 清空全部记录（红底，危险）
+                        Rectangle {
+                            height: 34px;
+                            border-radius: 8px;
+                            background: clear_all_btn.has-hover ? #5a2030 : #3a2030;
+
+                            clear_all_btn := TouchArea {
+                                clicked => {
+                                    root.confirm_kind = "all";
+                                    root.confirm_countdown = 2;
+                                }
+                            }
+
+                            Text {
+                                text: "清空全部记录（含备注）";
+                                color: #ff6b8b;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+
+                VerticalLayout {
+                    spacing: 8px;
+                    alignment: end;
+
+                    Text {
+                        text: "关于";
+                        color: #c8cfdd;
+                        font-size: 13px;
+                    }
+
+                    Text {
+                        text: "CCopy " + root.about_version;
+                        color: #9aa3b8;
+                        font-size: 12px;
+                    }
+
+                    Text {
+                        text: "轻量级剪贴板历史工具";
+                        color: #9aa3b8;
+                        font-size: 12px;
+                    }
+                }
+            }
+        }
+    }
+
+    // 倒计时定时器：每秒减 1，到 0 解禁确认按钮
+    confirm_timer := Timer {
+        interval: 1s;
+        running: root.confirm_kind != "" && root.confirm_countdown > 0;
+        triggered => {
+            if (root.confirm_countdown > 0) {
+                root.confirm_countdown -= 1;
+            }
+        }
+    }
+
+    // 二次确认弹层
+    if root.confirm_kind != "": Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #15171daa;
+
+        TouchArea {
+            clicked => {
+                root.confirm_cancel();
+            }
+        }
+
+        Rectangle {
+            x: (parent.width - 300px) / 2;
+            y: (parent.height - 140px) / 2;
+            width: 300px;
+            height: 140px;
+            background: #20242f;
+            border-radius: 12px;
+
+            TouchArea { }
+
+            Text {
+                x: 20px;
+                y: 22px;
+                width: parent.width - 40px;
+                text: root.confirm_kind == "all"
+                    ? "将清空全部记录（含备注），不可恢复，确认？"
+                    : "将清空所有未标记记录，确认？";
+                color: #eef1f8;
+                font-size: 13px;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+
+            // 取消按钮
+            Rectangle {
+                x: 30px;
+                y: 90px;
+                width: 100px;
+                height: 32px;
+                background: cancel_confirm_btn.has-hover ? #3a4152 : #15171d;
+                border-radius: 8px;
+
+                cancel_confirm_btn := TouchArea {
+                    clicked => {
+                        root.confirm_cancel();
+                    }
+                }
+
+                Text {
+                    text: "取消";
+                    color: #9aa3b8;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // 确认按钮（倒计时 >0 时禁用并显示倒计时）
+            Rectangle {
+                x: 170px;
+                y: 90px;
+                width: 100px;
+                height: 32px;
+                background: root.confirm_countdown > 0
+                    ? #3a2030
+                    : (ok_confirm_btn.has-hover ? #7a2840 : #5a2030);
+                border-radius: 8px;
+
+                ok_confirm_btn := TouchArea {
+                    enabled: root.confirm_countdown == 0;
+                    clicked => {
+                        root.confirm_accept();
+                    }
+                }
+
+                Text {
+                    text: root.confirm_countdown > 0
+                        ? "确认 (" + root.confirm_countdown + "s)"
+                        : "确认";
+                    color: #ff6b8b;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // 录制开始时聚焦 FocusScope，确保能接收按键
+    init => {
+        focus_scope.focus();
+    }
+}

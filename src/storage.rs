@@ -72,6 +72,11 @@ impl Storage {
                 FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE UNIQUE INDEX IF NOT EXISTS idx_clipboard_items_kind_hash
             ON clipboard_items(kind, hash);
 
@@ -234,19 +239,88 @@ impl Storage {
         Ok(id)
     }
 
-    pub fn recent_items(&self, limit: usize) -> rusqlite::Result<Vec<ClipboardItem>> {
-        let mut stmt = self.conn.prepare(
-            "
-            SELECT id, kind, preview, text_content, plain_text, blob_path, format_name, mime_type,
+    /// 分页查询：搜索 + 分类 + 分页一次查库完成。
+    /// query 为空表示不搜，category 为 "all" 表示不筛分类。
+    /// limit=0 表示不限制条数，offset 为分页偏移。
+    pub fn query_items(
+        &self,
+        query: &str,
+        category: &str,
+        limit: usize,
+        offset: usize,
+    ) -> rusqlite::Result<Vec<ClipboardItem>> {
+        let q = query.trim();
+        // 分类映射到 SQL：text 覆盖 text/html/rtf
+        let (has_query, has_category) = (!q.is_empty(), !matches!(category, "all" | ""));
+        let category_filter = match category {
+            "text" => "kind IN ('text','html','rtf')",
+            "image" => "kind = 'image'",
+            "files" => "kind = 'files'",
+            _ => "",
+        };
+
+        // 动态拼 WHERE 子句，参数用位置占位符 ? 按顺序绑定
+        let mut where_clauses: Vec<&str> = Vec::new();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if has_query {
+            where_clauses.push("(preview LIKE ? ESCAPE '\\' OR plain_text LIKE ? ESCAPE '\\' OR COALESCE(note,'') LIKE ? ESCAPE '\\')");
+            let like = format!("%{q}%");
+            params_vec.push(Box::new(like.clone()));
+            params_vec.push(Box::new(like.clone()));
+            params_vec.push(Box::new(like));
+        }
+        if has_category {
+            where_clauses.push(category_filter);
+        }
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
+        let limit_sql = if limit == 0 {
+            "LIMIT -1".to_string()
+        } else {
+            params_vec.push(Box::new(limit as i64));
+            params_vec.push(Box::new(offset as i64));
+            "LIMIT ? OFFSET ?".to_string()
+        };
+
+        let sql = format!(
+            "SELECT id, kind, preview, text_content, plain_text, blob_path, format_name, mime_type,
                    width, height, size_bytes, hash, note, created_at, updated_at, last_used_at
             FROM clipboard_items
+            {where_sql}
             ORDER BY updated_at DESC, id DESC
-            LIMIT ?1
-            ",
-        )?;
-
+            {limit_sql}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
         let mut items = Vec::new();
-        let mut rows = stmt.query(params![limit as i64])?;
+        let mut rows = stmt.query(params_ref.as_slice())?;
+        self.collect_items(&mut rows, &mut items)?;
+        Ok(items)
+    }
+
+    /// 按主键查询单条记录（含 files/tags），用于分页后按 id 取详情
+    pub fn get_item(&self, id: i64) -> rusqlite::Result<Option<ClipboardItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, preview, text_content, plain_text, blob_path, format_name, mime_type,
+                   width, height, size_bytes, hash, note, created_at, updated_at, last_used_at
+            FROM clipboard_items
+            WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        let mut items = Vec::new();
+        self.collect_items(&mut rows, &mut items)?;
+        Ok(items.into_iter().next())
+    }
+
+    /// 从已 prepare 的 rows 收集 ClipboardItem（含 files），复用给多个查询方法
+    fn collect_items(
+        &self,
+        rows: &mut rusqlite::Rows<'_>,
+        items: &mut Vec<ClipboardItem>,
+    ) -> rusqlite::Result<()> {
         while let Some(row) = rows.next()? {
             let kind_text: String = row.get(1)?;
             let kind = ClipboardKind::from_str(&kind_text).unwrap_or(ClipboardKind::Other);
@@ -288,8 +362,7 @@ impl Storage {
 
             items.push(item);
         }
-
-        Ok(items)
+        Ok(())
     }
 
     pub fn mark_used(&self, id: i64, now: i64) -> rusqlite::Result<()> {
@@ -315,7 +388,7 @@ impl Storage {
             .execute("DELETE FROM clipboard_items WHERE id = ?1", params![id])?;
 
         if let Some(blob_path) = blob_path {
-            let _ = fs::remove_file(data_dir().join(blob_path));
+            remove_blob_and_thumb(&blob_path);
         }
 
         Ok(())
@@ -331,6 +404,150 @@ impl Storage {
             params![note, now, id],
         )?;
         Ok(())
+    }
+
+    /// 读取设置项，返回 None 表示未设置
+    pub fn get_setting(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+    }
+
+    /// 写入或更新设置项
+    pub fn set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// 清理规则的豁免条件 SQL 片段：满足该条件的记录不会被清理。
+    /// 当前为「有备注」，未来扩展置顶/收藏等只需在此追加 OR 分支。
+    fn protected_expr() -> &'static str {
+        "note IS NOT NULL AND note != ''"
+    }
+
+    /// 按规则清理：OR 保留语义。
+    /// 非豁免记录满足「排在前 max_count 条内」或「updated_at 在 max_age_days 天内」任一即保留。
+    /// max_count=0 表示不靠条数保留；max_age_days=0 表示不靠时间保留。
+    /// 两者均为 0 时直接返回（无任何清理）。
+    pub fn purge_by_rule(&self, max_count: usize, max_age_days: usize) -> rusqlite::Result<()> {
+        if max_count == 0 && max_age_days == 0 {
+            return Ok(());
+        }
+
+        let protected = Self::protected_expr();
+        let now = crate::common::now_millis();
+        let age_threshold = now - (max_age_days as i64) * 86_400_000;
+
+        // OR 保留取反 = AND 删除：
+        // 删除 = 非豁免 AND (若配条数: 排在 max_count 之外) AND (若配天数: updated_at 早于阈值)
+        let mut conditions = vec![format!("NOT ({protected})")];
+        if max_count > 0 {
+            conditions.push(format!(
+                "id NOT IN (SELECT id FROM clipboard_items ORDER BY updated_at DESC, id DESC LIMIT {max_count})"
+            ));
+        }
+        if max_age_days > 0 {
+            conditions.push(format!("updated_at < {age_threshold}"));
+        }
+        let where_clause = conditions.join(" AND ");
+
+        // 取待删记录的 id 和 blob_path
+        let to_delete: Vec<(i64, Option<String>)> = {
+            let sql = format!("SELECT id, blob_path FROM clipboard_items WHERE {where_clause}");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        if to_delete.is_empty() {
+            return Ok(());
+        }
+
+        // 删除 blob 文件及对应缩略图
+        for (_, blob_path) in &to_delete {
+            if let Some(p) = blob_path {
+                remove_blob_and_thumb(p);
+            }
+        }
+
+        // 删除数据库记录
+        let ids: Vec<i64> = to_delete.iter().map(|(id, _)| *id).collect();
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        self.conn.execute(
+            &format!("DELETE FROM clipboard_items WHERE id IN ({placeholders})"),
+            rusqlite::params_from_iter(ids.iter()),
+        )?;
+
+        Ok(())
+    }
+
+    /// 清空所有未标记（无备注）的记录，保留有备注的记录及其 blob 文件。
+    pub fn clear_unnoted(&self) -> rusqlite::Result<()> {
+        let protected = Self::protected_expr();
+        let to_delete: Vec<Option<String>> = {
+            let sql = format!(
+                "SELECT blob_path FROM clipboard_items WHERE NOT ({protected})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        for blob_path in &to_delete {
+            if let Some(p) = blob_path {
+                remove_blob_and_thumb(p);
+            }
+        }
+
+        let sql = format!("DELETE FROM clipboard_items WHERE NOT ({protected})");
+        self.conn.execute(&sql, [])?;
+        Ok(())
+    }
+
+    /// 清空所有剪贴板历史记录，同时删除关联的 blob 文件及 blobs 目录下的孤儿文件
+    pub fn clear_all(&self) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM clipboard_items", [])?;
+
+        // 删除整个 blobs 目录下的所有文件，确保缓存图片等彻底清理
+        let blobs_dir = data_dir().join("blobs");
+        if blobs_dir.exists() {
+            if let Ok(entries) = fs::read_dir(&blobs_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let _ = fs::remove_dir_all(&path);
+                }
+            }
+            // 重建空的子目录
+            let _ = fs::create_dir_all(blobs_dir.join("image"));
+            let _ = fs::create_dir_all(blobs_dir.join("other"));
+        }
+
+        Ok(())
+    }
+}
+
+/// 删除 blob 源文件及其对应缩略图。
+/// 缩略图与源文件同目录，命名为 `{stem}.thumb.png`。
+fn remove_blob_and_thumb(blob_path: &str) {
+    let full = data_dir().join(blob_path);
+    let _ = fs::remove_file(&full);
+
+    // 构造缩略图路径：去掉扩展名后追加 .thumb.png
+    let path = std::path::Path::new(blob_path);
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        let thumb = path
+            .with_file_name(format!("{stem}.thumb.png"));
+        let _ = fs::remove_file(data_dir().join(thumb));
     }
 }
 

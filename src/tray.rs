@@ -1,4 +1,4 @@
-use std::cell::Cell;
+﻿use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::platform::ForegroundWindow;
@@ -10,6 +10,7 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 pub fn create_tray_icon(
     app: Weak<MainWindow>,
     paste_target: Rc<Cell<Option<ForegroundWindow>>>,
+    on_settings: Box<dyn Fn()>,
 ) -> Option<TrayIcon> {
     let size = 32u32;
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
@@ -34,7 +35,9 @@ pub fn create_tray_icon(
     };
 
     let menu = Menu::new();
+    let settings_item = MenuItem::new("设置", true, None);
     let quit = MenuItem::new("退出", true, None);
+    let _ = menu.append(&settings_item);
     let _ = menu.append(&quit);
 
     let tray = match TrayIconBuilder::new()
@@ -66,7 +69,9 @@ pub fn create_tray_icon(
     let menu_timer = Timer::default();
     menu_timer.start(TimerMode::Repeated, std::time::Duration::from_millis(50), move || {
         if let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == quit.id() {
+            if event.id == settings_item.id() {
+                on_settings();
+            } else if event.id == quit.id() {
                 if let Some(app) = app_weak.upgrade() {
                     app.hide().ok();
                     let _ = slint::quit_event_loop();
