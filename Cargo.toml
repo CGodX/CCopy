@@ -1,6 +1,6 @@
 [package]
 name = "ccopy"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 
 [package.metadata.packager]
@@ -8,9 +8,14 @@ product-name = "CCopy"
 identifier = "com.ccopy.app"
 before-packaging-command = "cargo build --release"
 formats = ["nsis", "dmg"]
+icons = ["packager/icon.ico"]
 
 [package.metadata.packager.nsis]
 appdata-paths = ["$APPDATA/CCopy"]
+installer-mode = "perMachine"
+languages = ["SimpChinese", "English"]
+installer-icon = "packager/icon.ico"
+template = "packager/installer.nsi"
 
 [profile.dev]
 opt-level = 0
@@ -29,3 +34,4 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graph
 
 [build-dependencies]
 slint-build = "1.16.1"
+winres = "0.1"
