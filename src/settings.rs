@@ -2,12 +2,14 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use slint::{ComponentHandle, SharedString};
 
 use crate::hotkey::{HotkeyRegistrar, HotkeySpec};
 use crate::storage::Storage;
 use crate::ui::SettingsWindow;
+use crate::updater::{CheckResult, UpdateInfo};
 use crate::{SETTING_HOTKEY, SETTING_MAX_AGE_DAYS, SETTING_MAX_HISTORY};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -15,12 +17,14 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 打开设置窗口。已打开则聚焦。
 /// - `current_hotkey_id`: 共享的当前热键 id，注册成功后更新
 /// - `refresh_history`: 设置变更后回调，让主面板刷新历史
+/// - `update_info`: 共享的更新检查结果，设置页据此初始化更新状态
 pub fn open(
     storage: Rc<RefCell<Storage>>,
     registrar: Rc<RefCell<HotkeyRegistrar>>,
     current_hotkey_id: Rc<Cell<Option<u32>>>,
     window_ref: Rc<RefCell<Option<SettingsWindow>>>,
     refresh_history: impl Fn() + 'static,
+    update_info: Arc<Mutex<Option<UpdateInfo>>>,
 ) {
     // 已打开则聚焦，不重复创建
     if window_ref.borrow().is_some() {
@@ -47,6 +51,18 @@ pub fn open(
     window.set_confirm_kind(SharedString::from(""));
     window.set_confirm_countdown(0);
     window.set_about_version(SharedString::from(APP_VERSION));
+
+    // 更新状态初始化：读取启动时后台检查的结果
+    window.set_update_busy(false);
+    if let Some(info) = update_info.lock().unwrap().as_ref() {
+        window.set_update_status(SharedString::from(format!("新版本 v{}", info.version)));
+        window.set_update_available(true);
+        window.set_update_url(SharedString::from(info.url.clone()));
+    } else {
+        window.set_update_status(SharedString::from(""));
+        window.set_update_available(false);
+        window.set_update_url(SharedString::from(""));
+    }
 
     // 拖拽
     let drag_state = Rc::new(RefCell::new(None::<crate::drag::DragState>));
@@ -207,6 +223,69 @@ pub fn open(
             w.set_confirm_countdown(0);
         }
         refresh_confirm();
+    });
+
+    // 手动检查更新：后台执行，结果回传主线程更新 UI 并写入共享状态
+    let update_info_check = update_info.clone();
+    let window_weak = window.as_weak();
+    window.on_check_update(move || {
+        let w = match window_weak.upgrade() {
+            Some(w) => w,
+            None => return,
+        };
+        w.set_update_busy(true);
+        w.set_update_status(SharedString::from("正在检查…"));
+        let window_weak = window_weak.clone();
+        let update_info = update_info_check.clone();
+        std::thread::spawn(move || {
+            let result = crate::updater::check();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(w) = window_weak.upgrade() else { return };
+                w.set_update_busy(false);
+                match result {
+                    Ok(CheckResult::Available(info)) => {
+                        w.set_update_status(SharedString::from(format!("新版本 v{}", info.version)));
+                        w.set_update_url(SharedString::from(info.url.clone()));
+                        w.set_update_available(true);
+                        *update_info.lock().unwrap() = Some(info);
+                    }
+                    Ok(CheckResult::UpToDate) => {
+                        w.set_update_status(SharedString::from("已是最新版本"));
+                        w.set_update_available(false);
+                    }
+                    Err(e) => {
+                        w.set_update_status(SharedString::from(format!("检查失败: {e}")));
+                        w.set_update_available(false);
+                    }
+                }
+            });
+        });
+    });
+
+    // 立即更新：后台下载安装包并静默安装，完成后退出由安装器重启
+    let window_weak = window.as_weak();
+    window.on_do_update(move |url| {
+        let url = url.to_string();
+        let window_weak = window_weak.clone();
+        if let Some(w) = window_weak.upgrade() {
+            w.set_update_busy(true);
+            w.set_update_status(SharedString::from("正在下载更新…"));
+        }
+        std::thread::spawn(move || {
+            match crate::updater::download_and_install(&url) {
+                Ok(()) => {
+                    // 安装器已接管，进程即将退出
+                }
+                Err(e) => {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(w) = window_weak.upgrade() {
+                            w.set_update_busy(false);
+                            w.set_update_status(SharedString::from(format!("更新失败: {e}")));
+                        }
+                    });
+                }
+            }
+        });
     });
 
     // 关键：把强引用存入 window_ref，保持窗口存活

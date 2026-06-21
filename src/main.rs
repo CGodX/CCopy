@@ -3,6 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
@@ -18,6 +19,7 @@ use crate::filter::{append_model, fill_model};
 use crate::hotkey::HotkeyRegistrar;
 use crate::platform::PasteTarget;
 use crate::storage::Storage;
+use crate::updater::{CheckResult, UpdateInfo};
 
 mod autostart;
 mod clipboard_history;
@@ -31,6 +33,7 @@ mod settings;
 mod storage;
 mod tray;
 mod ui;
+mod updater;
 
 pub use ui::*;
 
@@ -541,6 +544,9 @@ app.on_search_changed(move |query| {
     let settings_window_ref: Rc<RefCell<Option<SettingsWindow>>> =
         Rc::new(RefCell::new(None));
 
+    // 共享的更新检查结果：启动自动检查与设置页手动检查共用（跨线程，用 Arc+Mutex）
+    let update_info: Arc<Mutex<Option<UpdateInfo>>> = Arc::new(Mutex::new(None));
+
     // 打开设置的统一逻辑：主窗口按钮和托盘菜单共用
     let open_settings_fn: Rc<dyn Fn()> = Rc::new({
         let storage = storage.clone();
@@ -551,6 +557,7 @@ app.on_search_changed(move |query| {
         let max_history = max_history.clone();
         let max_age_days = max_age_days.clone();
         let reload_history = reload_history.clone();
+        let update_info = update_info.clone();
         let app_weak = app.as_weak();
         move || {
             let app = app_weak.clone();
@@ -562,6 +569,7 @@ app.on_search_changed(move |query| {
             let max_history = max_history.clone();
             let max_age_days = max_age_days.clone();
             let reload_history = reload_history.clone();
+            let update_info = update_info.clone();
             let storage_for_refresh = storage.clone();
             let refresh = move || {
                 max_history.set(settings::load_max_history_value(&storage_for_refresh));
@@ -572,7 +580,7 @@ app.on_search_changed(move |query| {
                     reset_selected_id(&app, &selected_id);
                 }
             };
-            settings::open(storage, registrar, hotkey_id, settings_ref, refresh);
+            settings::open(storage, registrar, hotkey_id, settings_ref, refresh, update_info);
         }
     });
 
@@ -611,6 +619,17 @@ app.on_search_changed(move |query| {
 
     let open_for_tray = open_settings_fn.clone();
     let _tray = tray::create_tray_icon(app.as_weak(), paste_target.clone(), Box::new(move || open_for_tray()));
+
+    // 启动后后台静默检查更新（延迟 3 秒，避免启动卡顿），结果存入共享状态供设置页读取
+    {
+        let update_info = update_info.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            if let Ok(CheckResult::Available(info)) = updater::check() {
+                *update_info.lock().unwrap() = Some(info);
+            }
+        });
+    }
 
     let _keep_alive = (registrar, timer);
     slint::run_event_loop_until_quit().unwrap();

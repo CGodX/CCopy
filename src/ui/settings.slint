@@ -1,6 +1,6 @@
 export component SettingsWindow inherits Window {
     width: 450px;
-    height: 600px;
+    height: 650px;
     title: "CCopy 设置";
     background: #20242f;
     no-frame: true;
@@ -18,8 +18,20 @@ export component SettingsWindow inherits Window {
     in-out property <string> max_age_input;
     // 关于：版本号
     in-out property <string> about_version;
+    // 更新检查状态文本
+    in-out property <string> update_status;
+    // 是否有新版本可更新（控制「立即更新」按钮显隐）
+    in-out property <bool> update_available;
+    // 是否正在检查/下载更新（按钮禁用）
+    in-out property <bool> update_busy;
+    // 新版本下载地址（由 Rust 侧填入，点击立即更新时回传）
+    in-out property <string> update_url;
 
     callback close_requested();
+    // 手动检查更新
+    callback check_update();
+    // 立即更新（下载并安装）
+    callback do_update(string);
     callback drag_started();
     callback dragged();
     callback start_record();
@@ -397,6 +409,76 @@ export component SettingsWindow inherits Window {
                 VerticalLayout {
                     spacing: 8px;
                     alignment: end;
+
+                    // 检查更新
+                    VerticalLayout {
+                        spacing: 8px;
+
+                        Text {
+                            text: "更新";
+                            color: #c8cfdd;
+                            font-size: 13px;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+
+                            Text {
+                                text: root.update_status;
+                                color: #9aa3b8;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+
+                            // 检查更新按钮
+                            Rectangle {
+                                width: 80px;
+                                height: 28px;
+                                border-radius: 6px;
+                                background: check_btn.has-hover ? #3a4152 : #2d3342;
+
+                                check_btn := TouchArea {
+                                    enabled: !root.update_busy;
+                                    clicked => {
+                                        root.check_update();
+                                    }
+                                }
+
+                                Text {
+                                    text: "检查更新";
+                                    color: root.update_busy ? #6b7488 : #c8cfdd;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            // 立即更新按钮（仅在有新版本时显示）
+                            if root.update_available: Rectangle {
+                                width: 80px;
+                                height: 28px;
+                                border-radius: 6px;
+                                background: do_update_btn.has-hover ? #5a8cff : #4d7cff;
+
+                                do_update_btn := TouchArea {
+                                    enabled: !root.update_busy;
+                                    clicked => {
+                                        root.do_update(root.update_url);
+                                    }
+                                }
+
+                                Text {
+                                    text: "立即更新";
+                                    color: white;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
 
                     Text {
                         text: "关于";

@@ -15,7 +15,6 @@ appdata-paths = ["$APPDATA/CCopy"]
 installer-mode = "perMachine"
 languages = ["SimpChinese", "English"]
 installer-icon = "packager/icon.ico"
-template = "packager/installer.nsi"
 
 [profile.dev]
 opt-level = 0
@@ -27,8 +26,11 @@ global-hotkey = "0.8.0"
 mouse_position = "0.1.4"
 raw-window-handle = "0.6"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
 slint = { version = "1.16.1", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-femtovg", "std", "raw-window-handle-06", "live-preview"] }
 tray-icon = "0.24.1"
+ureq = { version = "3.3.0", features = ["_tls"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 
