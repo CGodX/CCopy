@@ -22,6 +22,7 @@ use crate::storage::Storage;
 use crate::updater::{CheckResult, UpdateInfo};
 
 mod autostart;
+mod categories;
 mod clipboard_history;
 mod clipboard_item;
 mod common;
@@ -95,6 +96,20 @@ fn main() {
     let history_model = Rc::new(VecModel::default());
     app.set_history(history_model.clone().into());
 
+    // 填充分类元数据，驱动 UI 按钮渲染与键盘循环
+    {
+        let cat_model = Rc::new(VecModel::from(
+            categories::CATEGORIES
+                .iter()
+                .map(|c| CategoryDef {
+                    id: c.id.into(),
+                    label: c.label.into(),
+                })
+                .collect::<Vec<_>>(),
+        ));
+        app.set_categories(cat_model.into());
+    }
+
     // 当前最大历史数（0=不限制），从设置加载，运行时可变更
     let max_history = Rc::new(Cell::new(settings::load_max_history_value(&storage)));
     // 当前最大保留天数（0=不限制），从设置加载，运行时可变更
@@ -106,15 +121,15 @@ fn main() {
     let has_more = Rc::new(Cell::new(true));
     let loading = Rc::new(Cell::new(false));
     let current_query = Rc::new(RefCell::new(String::new()));
-    let current_category = Rc::new(RefCell::new("all".to_string()));
+    let current_category = Rc::new(RefCell::new(categories::DEFAULT_CATEGORY.to_string()));
 
     // 重载历史（重置分页，查第一页）：用于打开面板、切换分类、搜索、删除等场景
-    let selected_category = Rc::new(RefCell::new("all".to_string()));
+    let selected_category = Rc::new(RefCell::new(categories::DEFAULT_CATEGORY.to_string()));
     let selected_id = Rc::new(Cell::new(0));
 
     // 首次加载第一页
     {
-        if let Ok(items) = storage.borrow().query_items("", "all", PAGE_SIZE, 0) {
+        if let Ok(items) = storage.borrow().query_items("", categories::DEFAULT_CATEGORY, PAGE_SIZE, 0) {
             fill_model(&history_model, &items);
             loaded_count.set(items.len());
             has_more.set(items.len() == PAGE_SIZE);
@@ -209,13 +224,13 @@ app.on_dragged(move || {
             .purge_by_rule(max_history_for_open.get(), max_age_for_open.get());
         // 重置搜索和分类，重新加载第一页
         *current_query_for_open.borrow_mut() = String::new();
-        *current_category_for_open.borrow_mut() = "all".to_string();
-        *selected_category_for_open.borrow_mut() = "all".to_string();
+        *current_category_for_open.borrow_mut() = categories::DEFAULT_CATEGORY.to_string();
+        *selected_category_for_open.borrow_mut() = categories::DEFAULT_CATEGORY.to_string();
         reload_for_open();
         last_shown_for_open.set(Some(Instant::now()));
         if let Some(app) = app_weak.upgrade() {
             app.set_search_text(String::new().into());
-            app.set_selected_category("all".into());
+            app.set_selected_category(categories::DEFAULT_CATEGORY.into());
             app.set_edit_note_id(-1);
             reset_selected_id(&app, &selected_id_for_open);
             // 延迟触发 focus，等窗口完成系统激活后再设置输入焦点
@@ -243,25 +258,46 @@ app.on_search_changed(move |query| {
     }
 });
 
-    let app_weak = app.as_weak();
-    let selected_id_for_category = selected_id.clone();
-    let selected_category_for_category = selected_category.clone();
-    let current_category_for_cat = current_category.clone();
-    let current_query_for_cat = current_query.clone();
-    let reload_for_category = reload_history.clone();
-    app.on_category_changed(move |category| {
-        *selected_category_for_category.borrow_mut() = category.to_string();
-        *current_category_for_cat.borrow_mut() = category.to_string();
-        let q = if let Some(app) = app_weak.upgrade() {
-            app.get_search_text().to_string()
-        } else {
-            current_query_for_cat.borrow().clone()
-        };
-        *current_query_for_cat.borrow_mut() = q;
-        reload_for_category();
-        if let Some(app) = app_weak.upgrade() {
-            reset_selected_id(&app, &selected_id_for_category);
+    // 应用分类切换：写 selected/current category，按当前 query 重载列表，重置选中项
+    let apply_category: Rc<dyn Fn(&str)> = Rc::new({
+        let selected_category = selected_category.clone();
+        let current_category = current_category.clone();
+        let current_query = current_query.clone();
+        let reload_history = reload_history.clone();
+        let selected_id = selected_id.clone();
+        let app_weak = app.as_weak();
+        move |category: &str| {
+            *selected_category.borrow_mut() = category.to_string();
+            *current_category.borrow_mut() = category.to_string();
+            let q = if let Some(app) = app_weak.upgrade() {
+                app.get_search_text().to_string()
+            } else {
+                current_query.borrow().clone()
+            };
+            *current_query.borrow_mut() = q;
+            reload_history();
+            if let Some(app) = app_weak.upgrade() {
+                app.set_selected_category(category.into());
+                reset_selected_id(&app, &selected_id);
+            }
         }
+    });
+
+    let apply_category_for_changed = apply_category.clone();
+    app.on_category_changed(move |category| {
+        apply_category_for_changed(category.as_str());
+    });
+
+    // 键盘 Alt+←/→ 循环分类：Rust 算出下一个，复用 apply_category 落地
+    let apply_category_for_cycle = apply_category.clone();
+    let app_weak_for_cycle = app.as_weak();
+    app.on_cycle_category(move |direction| {
+        let cur = app_weak_for_cycle
+            .upgrade()
+            .map(|a| a.get_selected_category().to_string())
+            .unwrap_or_else(|| categories::DEFAULT_CATEGORY.to_string());
+        let next = categories::cycle(&cur, direction);
+        apply_category_for_cycle(next);
     });
 
     let history_model_for_move = history_model.clone();
@@ -331,12 +367,12 @@ app.on_search_changed(move |query| {
             }
             // 重置搜索和分类，重新加载第一页
             *current_query_for_confirm.borrow_mut() = String::new();
-            *current_category_for_confirm.borrow_mut() = "all".to_string();
-            *selected_category_for_confirm.borrow_mut() = "all".to_string();
+            *current_category_for_confirm.borrow_mut() = categories::DEFAULT_CATEGORY.to_string();
+            *selected_category_for_confirm.borrow_mut() = categories::DEFAULT_CATEGORY.to_string();
             reload_for_confirm();
             if let Some(app) = app_weak.upgrade() {
                 app.set_search_text(String::new().into());
-                app.set_selected_category("all".into());
+                app.set_selected_category(categories::DEFAULT_CATEGORY.into());
                 reset_selected_id(&app, &selected_id_for_confirm);
                 let _ = app.hide();
             }
@@ -417,12 +453,12 @@ app.on_search_changed(move |query| {
             }
             // 重置搜索和分类，重新加载第一页
             *current_query_for_select.borrow_mut() = String::new();
-            *current_category_for_select.borrow_mut() = "all".to_string();
-            *selected_category_for_select.borrow_mut() = "all".to_string();
+            *current_category_for_select.borrow_mut() = categories::DEFAULT_CATEGORY.to_string();
+            *selected_category_for_select.borrow_mut() = categories::DEFAULT_CATEGORY.to_string();
             reload_for_select();
             if let Some(app) = app_weak.upgrade() {
                 app.set_search_text(String::new().into());
-                app.set_selected_category("all".into());
+                app.set_selected_category(categories::DEFAULT_CATEGORY.into());
                 reset_selected_id(&app, &selected_id_for_select);
                 let _ = app.hide();
             }

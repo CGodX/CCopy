@@ -12,6 +12,12 @@ export struct HistoryItem {
     has_thumbnail: bool,
 }
 
+// 分类元数据：由 Rust 侧填充，驱动按钮渲染与键盘循环
+export struct CategoryDef {
+    id: string,
+    label: string,
+}
+
 export component MainWindow inherits Window {
     width: 380px;
     height: 540px;
@@ -26,6 +32,7 @@ export component MainWindow inherits Window {
     callback item_deleted(int);
     callback search_changed(string);
     callback category_changed(string);
+    callback cycle_category(int);
     callback move_selection(int);
     callback confirm_selection();
     callback panel_opened();
@@ -35,6 +42,7 @@ export component MainWindow inherits Window {
     callback dragged();
     in-out property <string> search_text;
     in-out property <string> selected_category;
+    in property <[CategoryDef]> categories;
     in-out property <int> selected_id;
     in property <[HistoryItem]> history;
     in-out property <length> viewport-y;
@@ -109,24 +117,10 @@ export component MainWindow inherits Window {
                     }
                     accept
                 } else if (event.modifiers.alt && event.text == Key.RightArrow) {
-                    if root.selected_category == "all" {
-                        root.selected_category = "text";
-                    } else if root.selected_category == "text" {
-                        root.selected_category = "image";
-                    } else if root.selected_category == "image" {
-                        root.selected_category = "files";
-                    }
-                    root.category_changed(root.selected_category);
+                    root.cycle_category(1);
                     accept
                 } else if (event.modifiers.alt && event.text == Key.LeftArrow) {
-                    if root.selected_category == "files" {
-                        root.selected_category = "image";
-                    } else if root.selected_category == "image" {
-                        root.selected_category = "text";
-                    } else if root.selected_category == "text" {
-                        root.selected_category = "all";
-                    }
-                    root.category_changed(root.selected_category);
+                    root.cycle_category(-1);
                     accept
                 } else {
                     reject
@@ -227,24 +221,10 @@ export component MainWindow inherits Window {
                             }
                             accept
                         } else if (event.modifiers.alt && event.text == Key.RightArrow) {
-                            if root.selected_category == "all" {
-                                root.selected_category = "text";
-                            } else if root.selected_category == "text" {
-                                root.selected_category = "image";
-                            } else if root.selected_category == "image" {
-                                root.selected_category = "files";
-                            }
-                            root.category_changed(root.selected_category);
+                            root.cycle_category(1);
                             accept
                         } else if (event.modifiers.alt && event.text == Key.LeftArrow) {
-                            if root.selected_category == "files" {
-                                root.selected_category = "image";
-                            } else if root.selected_category == "image" {
-                                root.selected_category = "text";
-                            } else if root.selected_category == "text" {
-                                root.selected_category = "all";
-                            }
-                            root.category_changed(root.selected_category);
+                            root.cycle_category(-1);
                             accept
                         } else if (event.text == Key.Return) {
                             root.confirm_selection();
@@ -288,88 +268,22 @@ export component MainWindow inherits Window {
                 height: 30px;
                 spacing: 8px;
 
-                Rectangle {
+                for cat in root.categories: Rectangle {
                     width: 56px;
                     height: 30px;
                     border-radius: 15px;
-                    background: root.selected_category == "all" ? #4d7cff : (all_btn.has-hover ? #2d3342 : #20242f);
+                    background: root.selected_category == cat.id ? #4d7cff : (cat_touch.has-hover ? #2d3342 : #20242f);
 
-                    all_btn := TouchArea {
+                    cat_touch := TouchArea {
                         clicked => {
-                            root.selected_category = "all";
-                            root.category_changed("all");
+                            root.selected_category = cat.id;
+                            root.category_changed(cat.id);
                         }
                     }
 
                     Text {
-                        text: "全部";
-                        color: root.selected_category == "all" ? white : #c8cfdd;
-                        font-size: 13px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-
-                Rectangle {
-                    width: 56px;
-                    height: 30px;
-                    border-radius: 15px;
-                    background: root.selected_category == "text" ? #4d7cff : (text_btn.has-hover ? #2d3342 : #20242f);
-
-                    text_btn := TouchArea {
-                        clicked => {
-                            root.selected_category = "text";
-                            root.category_changed("text");
-                        }
-                    }
-
-                    Text {
-                        text: "文本";
-                        color: root.selected_category == "text" ? white : #c8cfdd;
-                        font-size: 13px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-
-                Rectangle {
-                    width: 56px;
-                    height: 30px;
-                    border-radius: 15px;
-                    background: root.selected_category == "image" ? #4d7cff : (image_btn.has-hover ? #2d3342 : #20242f);
-
-                    image_btn := TouchArea {
-                        clicked => {
-                            root.selected_category = "image";
-                            root.category_changed("image");
-                        }
-                    }
-
-                    Text {
-                        text: "图片";
-                        color: root.selected_category == "image" ? white : #c8cfdd;
-                        font-size: 13px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-
-                Rectangle {
-                    width: 56px;
-                    height: 30px;
-                    border-radius: 15px;
-                    background: root.selected_category == "files" ? #4d7cff : (files_btn.has-hover ? #2d3342 : #20242f);
-
-                    files_btn := TouchArea {
-                        clicked => {
-                            root.selected_category = "files";
-                            root.category_changed("files");
-                        }
-                    }
-
-                    Text {
-                        text: "文件";
-                        color: root.selected_category == "files" ? white : #c8cfdd;
+                        text: cat.label;
+                        color: root.selected_category == cat.id ? white : #c8cfdd;
                         font-size: 13px;
                         horizontal-alignment: center;
                         vertical-alignment: center;

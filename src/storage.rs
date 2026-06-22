@@ -250,12 +250,13 @@ impl Storage {
         offset: usize,
     ) -> rusqlite::Result<Vec<ClipboardItem>> {
         let q = query.trim();
-        // 分类映射到 SQL：text 覆盖 text/html/rtf
+        // 分类映射到 SQL：text 覆盖 text/html/rtf；marked 复用清理规则的豁免表达式
         let (has_query, has_category) = (!q.is_empty(), !matches!(category, "all" | ""));
         let category_filter = match category {
             "text" => "kind IN ('text','html','rtf')",
             "image" => "kind = 'image'",
             "files" => "kind = 'files'",
+            "marked" => Self::protected_expr(),
             _ => "",
         };
 
