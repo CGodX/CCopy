@@ -72,7 +72,6 @@ jobs:
           fi
           {
             echo "body<<EOF"
-            echo "## 提交明细"
             git log --pretty=format:"- %s (%h)" "$RANGE"
             echo ""
             echo "EOF"
