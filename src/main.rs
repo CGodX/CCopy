@@ -232,6 +232,7 @@ app.on_dragged(move || {
             app.set_search_text(String::new().into());
             app.set_selected_category(categories::DEFAULT_CATEGORY.into());
             app.set_edit_note_id(-1);
+            app.set_viewport_y(0.0);
             reset_selected_id(&app, &selected_id_for_open);
             // 延迟触发 focus，等窗口完成系统激活后再设置输入焦点
             let app_weak = app.as_weak();
@@ -254,6 +255,7 @@ app.on_search_changed(move |query| {
     *current_category_for_search.borrow_mut() = selected_category_for_search.borrow().clone();
     reload_for_search();
     if let Some(app) = app_weak.upgrade() {
+        app.set_viewport_y(0.0);
         reset_selected_id(&app, &selected_id_for_search);
     }
 });
@@ -278,6 +280,7 @@ app.on_search_changed(move |query| {
             reload_history();
             if let Some(app) = app_weak.upgrade() {
                 app.set_selected_category(category.into());
+                app.set_viewport_y(0.0);
                 reset_selected_id(&app, &selected_id);
             }
         }

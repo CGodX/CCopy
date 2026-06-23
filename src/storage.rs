@@ -168,9 +168,8 @@ impl Storage {
                     width = ?7,
                     height = ?8,
                     size_bytes = ?9,
-                    note = ?10,
-                    updated_at = ?11
-                WHERE id = ?12
+                    updated_at = ?10
+                WHERE id = ?11
                 ",
                 params![
                     item.preview,
@@ -182,7 +181,6 @@ impl Storage {
                     item.width,
                     item.height,
                     item.size_bytes,
-                    item.note,
                     item.updated_at,
                     id
                 ],
