@@ -261,9 +261,14 @@ impl Storage {
         // 动态拼 WHERE 子句，参数用位置占位符 ? 按顺序绑定
         let mut where_clauses: Vec<&str> = Vec::new();
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let like_pattern = if has_query {
+            Some(format!("%{q}%"))
+        } else {
+            None
+        };
         if has_query {
             where_clauses.push("(preview LIKE ? ESCAPE '\\' OR plain_text LIKE ? ESCAPE '\\' OR COALESCE(note,'') LIKE ? ESCAPE '\\')");
-            let like = format!("%{q}%");
+            let like = like_pattern.clone().unwrap();
             params_vec.push(Box::new(like.clone()));
             params_vec.push(Box::new(like.clone()));
             params_vec.push(Box::new(like));
@@ -284,12 +289,21 @@ impl Storage {
             "LIMIT ? OFFSET ?".to_string()
         };
 
+        // 搜索时备注匹配优先：备注匹配的条目排前面，其他匹配的排后面
+        let order_sql = if has_query {
+            let note_like = like_pattern.clone().unwrap();
+            params_vec.insert(0, Box::new(note_like));
+            "ORDER BY CASE WHEN COALESCE(note,'') LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END, updated_at DESC, id DESC"
+        } else {
+            "ORDER BY updated_at DESC, id DESC"
+        };
+
         let sql = format!(
             "SELECT id, kind, preview, text_content, plain_text, blob_path, format_name, mime_type,
                    width, height, size_bytes, hash, note, created_at, updated_at, last_used_at
             FROM clipboard_items
             {where_sql}
-            ORDER BY updated_at DESC, id DESC
+            {order_sql}
             {limit_sql}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
