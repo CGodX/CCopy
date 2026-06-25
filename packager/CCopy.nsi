@@ -9,7 +9,7 @@
 ;--------------------------------
 ; General information
 Name "CCopy"
-OutFile "release\CCopy-v0.3.1-windows-installer.exe"
+OutFile "release\CCopy-v0.3.5-windows-installer.exe"
 InstallDir "$PROGRAMFILES\CCopy"
 Icon "packager\icon.ico"
 UninstallIcon "packager\icon.ico"
