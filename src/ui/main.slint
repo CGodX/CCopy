@@ -54,6 +54,7 @@ export component MainWindow inherits Window {
     callback open_edit_note(int);
     callback edit_note_confirm(int, string);
     callback edit_note_cancel();
+    callback edit_selected_note();
 
     // 打开设置面板
     callback open_settings();
@@ -114,6 +115,16 @@ export component MainWindow inherits Window {
                     accept
                 } else if (event.modifiers.alt && event.text == Key.LeftArrow) {
                     root.cycle_category(-1);
+                    accept
+                } else if (event.text == Key.Delete) {
+                    if root.selected_id > 0 {
+                        root.item_deleted(root.selected_id);
+                    }
+                    accept
+                } else if (event.text == Key.F2) {
+                    if root.selected_id > 0 {
+                        root.edit_selected_note();
+                    }
                     accept
                 } else {
                     reject
@@ -232,6 +243,16 @@ export component MainWindow inherits Window {
                             accept
                         } else if (event.text == Key.Escape) {
                             root.hide_requested();
+                            accept
+                        } else if (event.text == Key.Delete) {
+                            if root.selected_id > 0 {
+                                root.item_deleted(root.selected_id);
+                            }
+                            accept
+                        } else if (event.text == Key.F2) {
+                            if root.selected_id > 0 {
+                                root.edit_selected_note();
+                            }
                             accept
                         } else {
                             reject
@@ -359,7 +380,7 @@ export component MainWindow inherits Window {
                             x: item.has_thumbnail ? 86px : 14px;
                             y: 8px;
                             width: parent.width - self.x - 48px;
-                            height: parent.height - 16px;
+                            // height: parent.height - 16px;
 
                             VerticalLayout {
                                 spacing: 4px;
@@ -373,7 +394,7 @@ export component MainWindow inherits Window {
                                     vertical-alignment: top;
                                     wrap: char-wrap;
                                     overflow: clip;
-                                    height: 52px;
+                                    height: 51px;
                                 }
 
                                 if item.note != "": Text {
@@ -441,6 +462,21 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
+                }
+            }
+
+            // 快捷键提示栏
+            Rectangle {
+                height: 14px;
+                background: transparent;
+
+                Text {
+                    text: "↑↓ 导航   Enter 粘贴   Del 删除   F2 备注   Esc 关闭   Alt + ←→ 分类";
+                    color: #6e6e73;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
                 }
             }
         }

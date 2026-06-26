@@ -413,6 +413,7 @@ app.on_search_changed(move |query| {
         }
         if let Some(app) = app_weak.upgrade() {
             app.set_edit_note_id(-1);
+            app.invoke_focus_search();
         }
     });
 
@@ -420,6 +421,26 @@ app.on_search_changed(move |query| {
     app.on_edit_note_cancel(move || {
         if let Some(app) = app_weak.upgrade() {
             app.set_edit_note_id(-1);
+            app.invoke_focus_search();
+        }
+    });
+
+    // F2 编辑选中项备注：根据 selected_id 查找对应 index
+    let history_model_for_edit = history_model.clone();
+    let selected_id_for_edit = selected_id.clone();
+    let app_weak = app.as_weak();
+    app.on_edit_selected_note(move || {
+        let target_id = selected_id_for_edit.get();
+        for idx in 0..history_model_for_edit.row_count() {
+            let row = history_model_for_edit.row_data(idx).unwrap();
+            if row.id == target_id {
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_edit_note_id(target_id);
+                    app.set_edit_note_text(row.note);
+                    app.set_edit_note_row_index(idx as i32);
+                }
+                break;
+            }
         }
     });
 
