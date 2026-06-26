@@ -25,6 +25,7 @@ pub fn item_to_history_item(item: &ClipboardItem, data_dir: &Path) -> HistoryIte
         note: SharedString::from(item.note.as_ref().map(|s| s.as_str()).unwrap_or("")),
         thumbnail: thumbnail.unwrap_or_default(),
         has_thumbnail,
+        blob_path: SharedString::from(item.blob_path.as_deref().unwrap_or("")),
     }
 }
 

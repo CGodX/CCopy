@@ -143,13 +143,38 @@ let last_shown = Rc::new(Cell::new(None::<Instant>));
 
 app.set_edit_note_id(-1);
 
-fn reset_selected_id(app: &MainWindow, selected_id: &Cell<i32>) {
+fn reset_selected_id(app: &MainWindow, selected_id: &Cell<i32>, storage: &Storage) {
     let first = app.get_history().iter().next().map(|i| i.id).unwrap_or(0);
     selected_id.set(first);
     app.set_selected_id(first);
+    update_selected_full_image(app, first, storage);
 }
 
-reset_selected_id(&app, &selected_id);
+fn update_selected_full_image(app: &MainWindow, id: i32, _storage: &Storage) {
+    // 直接从已加载的 model 取 blob_path，不再查数据库
+    let blob_path = app
+        .get_history()
+        .iter()
+        .find(|i| i.id == id)
+        .map(|i| i.blob_path.to_string())
+        .unwrap_or_default();
+    load_full_image_by_path(&app, &blob_path);
+}
+
+fn load_full_image_by_path(app: &MainWindow, blob_path: &str) {
+    if blob_path.is_empty() {
+        app.set_selected_full_image(slint::Image::default());
+        return;
+    }
+    let full_path = crate::storage::data_dir().join(blob_path);
+    // 同步加载：路径加载会解码图片，但通过调用方防抖避免连续切换时频繁触发
+    match slint::Image::load_from_path(&full_path) {
+        Ok(img) => app.set_selected_full_image(img),
+        Err(_) => app.set_selected_full_image(slint::Image::default()),
+    }
+}
+
+reset_selected_id(&app, &selected_id, &storage.borrow());
 
 // 重载历史第一页：重置分页状态，按当前 query/category 查询并填充 model
 let reload_history: Rc<dyn Fn()> = Rc::new({
@@ -233,7 +258,7 @@ app.on_dragged(move || {
             app.set_selected_category(categories::DEFAULT_CATEGORY.into());
             app.set_edit_note_id(-1);
             app.set_viewport_y(0.0);
-            reset_selected_id(&app, &selected_id_for_open);
+            reset_selected_id(&app, &selected_id_for_open, &storage_for_open.borrow());
             // 延迟触发 focus，等窗口完成系统激活后再设置输入焦点
             let app_weak = app.as_weak();
             slint::Timer::single_shot(std::time::Duration::from_millis(50), move || {
@@ -248,6 +273,7 @@ let selected_id_for_search = selected_id.clone();
 let current_query_for_search = current_query.clone();
 let current_category_for_search = current_category.clone();
 let selected_category_for_search = selected_category.clone();
+let storage_for_search = storage.clone();
 let reload_for_search = reload_history.clone();
 let app_weak = app.as_weak();
 app.on_search_changed(move |query| {
@@ -256,7 +282,7 @@ app.on_search_changed(move |query| {
     reload_for_search();
     if let Some(app) = app_weak.upgrade() {
         app.set_viewport_y(0.0);
-        reset_selected_id(&app, &selected_id_for_search);
+        reset_selected_id(&app, &selected_id_for_search, &storage_for_search.borrow());
     }
 });
 
@@ -267,6 +293,7 @@ app.on_search_changed(move |query| {
         let current_query = current_query.clone();
         let reload_history = reload_history.clone();
         let selected_id = selected_id.clone();
+        let storage_for_category = storage.clone();
         let app_weak = app.as_weak();
         move |category: &str| {
             *selected_category.borrow_mut() = category.to_string();
@@ -281,7 +308,7 @@ app.on_search_changed(move |query| {
             if let Some(app) = app_weak.upgrade() {
                 app.set_selected_category(category.into());
                 app.set_viewport_y(0.0);
-                reset_selected_id(&app, &selected_id);
+                reset_selected_id(&app, &selected_id, &storage_for_category.borrow());
             }
         }
     });
@@ -306,6 +333,9 @@ app.on_search_changed(move |query| {
     let history_model_for_move = history_model.clone();
     let selected_id_for_move = selected_id.clone();
     let app_weak = app.as_weak();
+    // 防抖 Timer：长按连续切换时只加载最后停留项的图片，避免卡顿
+    let preview_timer = Rc::new(slint::Timer::default());
+    let preview_timer_for_move = preview_timer.clone();
     app.on_move_selection(move |delta| {
         // 从已加载的 model 读取可见项做键盘导航
         let visible: Vec<i32> = history_model_for_move
@@ -324,6 +354,23 @@ app.on_search_changed(move |query| {
         selected_id_for_move.set(id);
         if let Some(app) = app_weak.upgrade() {
             app.set_selected_id(id);
+            // 防抖：80ms 内连续切换只执行最后一次图片加载
+            let app_weak = app_weak.clone();
+            let model = history_model_for_move.clone();
+            preview_timer_for_move.start(
+                slint::TimerMode::SingleShot,
+                std::time::Duration::from_millis(80),
+                move || {
+                    if let Some(app) = app_weak.upgrade() {
+                        let blob_path = model
+                            .iter()
+                            .find(|i| i.id == id)
+                            .map(|i| i.blob_path.to_string())
+                            .unwrap_or_default();
+                        load_full_image_by_path(&app, &blob_path);
+                    }
+                },
+            );
             const ITEM_H: f32 = 78.0;
             const SPACING: f32 = 10.0;
             const STEP: f32 = ITEM_H + SPACING;
@@ -339,6 +386,32 @@ app.on_search_changed(move |query| {
             let max_vp = app.get_content_height() as f32 - visible_h;
             let vp = vp.min(0.0).max(-max_vp.max(0.0));
             app.set_viewport_y(vp);
+        }
+    });
+
+    // 鼠标悬浮时优先显示悬浮项的图片预览，离开后恢复选中项
+    let selected_id_for_hover = selected_id.clone();
+    let last_hover_id = Rc::new(Cell::new(-1));
+    let last_hover_id_for_cb = last_hover_id.clone();
+    let app_weak = app.as_weak();
+    app.on_item_hovered(move |id| {
+        // 只在 hover 的 id 变化时才加载图片，避免 move 事件频繁触发重复加载
+        if last_hover_id_for_cb.get() == id {
+            return;
+        }
+        last_hover_id_for_cb.set(id);
+        if let Some(app) = app_weak.upgrade() {
+            app.set_hovered_id(id);
+            // 从已加载的 model 取 blob_path，不再查数据库
+            let target_id = if id > 0 { id } else { selected_id_for_hover.get() };
+            let blob_path = app
+                .get_history()
+                .iter()
+                .find(|i| i.id == target_id)
+                .map(|i| i.blob_path.to_string())
+                .unwrap_or_default();
+            // 悬浮时直接加载（已有 last_hover_id 去重，不会频繁触发）
+            load_full_image_by_path(&app, &blob_path);
         }
     });
 
@@ -376,7 +449,7 @@ app.on_search_changed(move |query| {
             if let Some(app) = app_weak.upgrade() {
                 app.set_search_text(String::new().into());
                 app.set_selected_category(categories::DEFAULT_CATEGORY.into());
-                reset_selected_id(&app, &selected_id_for_confirm);
+                reset_selected_id(&app, &selected_id_for_confirm, &storage_for_confirm.borrow());
                 let _ = app.hide();
             }
             if let Some(target) = paste_target_for_confirm.get() {
@@ -483,7 +556,7 @@ app.on_search_changed(move |query| {
             if let Some(app) = app_weak.upgrade() {
                 app.set_search_text(String::new().into());
                 app.set_selected_category(categories::DEFAULT_CATEGORY.into());
-                reset_selected_id(&app, &selected_id_for_select);
+                reset_selected_id(&app, &selected_id_for_select, &storage_for_select.borrow());
                 let _ = app.hide();
             }
             if let Some(target) = paste_target_for_select.get() {
@@ -637,7 +710,7 @@ app.on_search_changed(move |query| {
                 // 清理规则变更后重新加载第一页
                 reload_history();
                 if let Some(app) = app.upgrade() {
-                    reset_selected_id(&app, &selected_id);
+                    reset_selected_id(&app, &selected_id, &storage_for_refresh.borrow());
                 }
             };
             settings::open(storage, registrar, hotkey_id, settings_ref, refresh, update_info);

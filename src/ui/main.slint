@@ -10,6 +10,7 @@ export struct HistoryItem {
     note: string,
     thumbnail: image,
     has_thumbnail: bool,
+    blob_path: string,
 }
 
 // 分类元数据：由 Rust 侧填充，驱动按钮渲染与键盘循环
@@ -51,7 +52,10 @@ export component MainWindow inherits Window {
     in-out property <string> edit_note_text;
     in-out property <int> edit_note_id;
     in-out property <int> edit_note_row_index;
+    in-out property <int> hovered_id: -1;
+    in-out property <image> selected_full_image;
     callback open_edit_note(int);
+    callback item_hovered(int);
     callback edit_note_confirm(int, string);
     callback edit_note_cancel();
     callback edit_selected_note();
@@ -352,6 +356,11 @@ export component MainWindow inherits Window {
                         background: item.id == root.selected_id ? #007aff15 : (touch.has-hover ? #2c2c2e : #1c1c1e);
 
                         touch := TouchArea {
+                            pointer-event(event) => {
+                                if event.kind == PointerEventKind.move {
+                                    root.item_hovered(item.id);
+                                }
+                            }
                             clicked => {
                                 root.item_selected(item.id);
                             }
@@ -479,6 +488,26 @@ export component MainWindow inherits Window {
                     width: 100%;
                 }
             }
+        }
+    }
+
+    // 图片放大预览（选中图片项时显示在窗口右下角悬浮）
+    if root.selected_full_image.width > 0 && root.selected_full_image.height > 0: Rectangle {
+        x: root.width - 280px - 8px;
+        y: root.height - 280px - 32px;
+        width: 280px;
+        height: 280px;
+        border-radius: 14px;
+        background: #1c1c1e;
+        border-width: 1px;
+        border-color: #3a3a3c;
+        drop-shadow-blur: 8px;
+
+        Image {
+            width: 280px;
+            height: 280px;
+            source: root.selected_full_image;
+            image-fit: contain;
         }
     }
 
