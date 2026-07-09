@@ -25,6 +25,8 @@
 
 ![主界面](assets/main.png)
 
+![设置页](assets/settings.png)
+
 ## 快捷键
 
 | 快捷键 | 操作 |
