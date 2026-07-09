@@ -410,16 +410,16 @@ export component MainWindow inherits Window {
                         }
 
                         VerticalLayout {
-                            padding: 10px;
-                            spacing: 4px;
+                            padding: 8px;
+                            spacing: 0px;
                             alignment: space-between;
 
                             // 标签与正文同一行：标签在前，正文跟随
                             HorizontalLayout {
-                                spacing: 6px;
+                                spacing: 2px;
 
                                 // 类型标签：文件/图片项显示，与正文区分
-                                if item.tag_text != "": Rectangle {
+                                if item.tag_text != "" : Rectangle {
                                     height: 18px;
                                     width: tag_label.preferred-width + 12px;
                                     y: (parent.height - self.height) / 2;
@@ -439,48 +439,57 @@ export component MainWindow inherits Window {
                                     }
                                 }
 
-                                // 正文：图片项叠加在缩略图上，加紧贴文字的背景保证可读
+                                // 正文：stretch 填满标签之后的剩余宽度，超长内容自动换行
                                 Rectangle {
-                                    height: 20px;
-                                    width: body_text.preferred-width + 8px;
-                                    y: (parent.height - self.height) / 2;
+                                    // 不设 width，HorizontalLayout 默认 stretch 填满剩余空间
                                     border-radius: 3px;
                                     background: item.has_thumbnail ? #00000099 : transparent;
+
                                     visible: item.text != "";
 
                                     body_text := Text {
+                                        y: 0px;
                                         x: 4px;
+                                        width: parent.width - 40px;
+                                        height: (item.note != "" ? 3 : 4) * (17px);
+                                        // height: (item.note != "" ? 3 : 4) * (-self.font-metrics.descent);
+                                        // height: (item.note != "" ? 3 : 4) * (self.font-metrics.ascent + self.font-metrics.descent)*1.5;
                                         text: item.text;
                                         color: #f5f5f7;
                                         font-size: 14px;
                                         font-weight: 400;
-                                        vertical-alignment: center;
                                         horizontal-alignment: left;
+                                        // 按字符换行：保证超长 URL 也能断行显示，中文英文均适用
+                                        wrap: char-wrap;
+                                        // wrap: word-wrap;
+                                        overflow: clip;
                                     }
                                 }
                             }
 
                             // 备注：图片项同样加背景
                             if item.note != "": Rectangle {
-                                height: 20px;
-                                width: note_text.preferred-width + 8px;
                                 border-radius: 3px;
                                 background: item.has_thumbnail ? #00000099 : transparent;
 
                                 note_text := Text {
                                     x: 4px;
+                                    width: parent.width - 8px;
+                                    height: 22px;
                                     text: item.note;
                                     color: item.has_thumbnail ? #c7c7cc : #6e6e73;
                                     font-size: 12px;
-                                    vertical-alignment: center;
+                                    // vertical-alignment: center;
                                     horizontal-alignment: left;
+                                    wrap: char-wrap;
+                                    overflow: clip;
                                 }
                             }
                         }
 
                         // 编辑备注按钮
                         Rectangle {
-                            x: parent.width - 38px;
+                            x: parent.width - 35px;
                             y: 8px;
                             width: 26px;
                             height: 26px;
@@ -506,7 +515,7 @@ export component MainWindow inherits Window {
 
                         // 删除按钮
                         Rectangle {
-                            x: parent.width - 38px;
+                            x: parent.width - 35px;
                             y: 40px;
                             width: 26px;
                             height: 26px;
