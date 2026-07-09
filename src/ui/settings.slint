@@ -1,3 +1,5 @@
+import { ScrollView } from "std-widgets.slint";
+
 export component SettingsWindow inherits Window {
     width: 460px;
     height: 660px;
@@ -26,6 +28,16 @@ export component SettingsWindow inherits Window {
     in-out property <bool> update_busy;
     // 新版本下载地址（由 Rust 侧填入，点击立即更新时回传）
     in-out property <string> update_url;
+    // 统计：总条数
+    in-out property <int> stat_total;
+    // 统计：有备注条数
+    in-out property <int> stat_marked;
+    // 统计：文本条数
+    in-out property <int> stat_text;
+    // 统计：图片条数
+    in-out property <int> stat_image;
+    // 统计：文件条数
+    in-out property <int> stat_files;
 
     callback close_requested();
     // 手动检查更新
@@ -129,58 +141,458 @@ export component SettingsWindow inherits Window {
                     }
                 }
 
-                VerticalLayout {
-                    spacing: 20px;
-                    alignment: start;
+                Rectangle {
+                    vertical-stretch: 1;
 
-                    // 快捷键
-                    VerticalLayout {
-                        spacing: 10px;
+                    ScrollView {
+                        x: 0;
+                        y: 0;
+                        width: 100%;
+                        height: 100%;
 
-                        Text {
-                            text: "唤起快捷键";
-                            color: #aeaeb2;
-                            font-size: 13px;
-                            font-weight: 500;
-                        }
+                        VerticalLayout {
+                            spacing: 20px;
+                            alignment: start;
 
-                        Rectangle {
-                            height: 40px;
-                            border-radius: 10px;
-                            background: #2c2c2e;
-                            border-width: 1px;
-                            border-color: root.hotkey_recording ? #007aff : #3a3a3c;
-
-                            HorizontalLayout {
-                                padding-left: 14px;
-                                padding-right: 10px;
-                                spacing: 8px;
+                            VerticalLayout {
+                                // 快捷键
+                                spacing: 10px;
 
                                 Text {
-                                    text: root.hotkey_recording ? "按下新的快捷键…" : root.hotkey_display;
-                                    color: root.hotkey_recording ? #007aff : #f5f5f7;
-                                    font-size: 14px;
-                                    vertical-alignment: center;
-                                    horizontal-alignment: left;
+                                    text: "唤起快捷键";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
                                 }
 
                                 Rectangle {
-                                    width: 64px;
-                                    height: 30px;
-                                    y: (parent.height - self.height) / 2;
-                                    border-radius: 8px;
-                                    background: record_btn.has-hover ? #3a3a3c : #1c1c1e;
+                                    height: 40px;
+                                    border-radius: 10px;
+                                    background: #2c2c2e;
+                                    border-width: 1px;
+                                    border-color: root.hotkey_recording ? #007aff : #3a3a3c;
 
-                                    record_btn := TouchArea {
+                                    HorizontalLayout {
+                                        padding-left: 14px;
+                                        padding-right: 10px;
+                                        spacing: 8px;
+
+                                        Text {
+                                            text: root.hotkey_recording ? "按下新的快捷键…" : root.hotkey_display;
+                                            color: root.hotkey_recording ? #007aff : #f5f5f7;
+                                            font-size: 14px;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: left;
+                                        }
+
+                                        Rectangle {
+                                            width: 64px;
+                                            height: 30px;
+                                            y: (parent.height - self.height) / 2;
+                                            border-radius: 8px;
+                                            background: record_btn.has-hover ? #3a3a3c : #1c1c1e;
+
+                                            record_btn := TouchArea {
+                                                clicked => {
+                                                    root.start_record();
+                                                }
+                                            }
+
+                                            Text {
+                                                text: "录制";
+                                                color: #aeaeb2;
+                                                font-size: 13px;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                // 开机自启
+                                height: 32px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: "开机自启动";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    vertical-alignment: center;
+                                }
+
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                }
+
+                                Rectangle {
+                                    // 苹果风格开关
+                                    width: 48px;
+                                    height: 28px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 14px;
+                                    background: root.autostart_enabled ? #34c759 : #3a3a3c;
+
+                                    autostart_toggle := TouchArea {
                                         clicked => {
-                                            root.start_record();
+                                            root.toggle_autostart();
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        x: root.autostart_enabled ? (parent.width - self.width - 3px) : 3px;
+                                        y: 3px;
+                                        width: 22px;
+                                        height: 22px;
+                                        border-radius: 11px;
+                                        background: #ffffff;
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                // 自动清理规则
+                                spacing: 10px;
+
+                                Text {
+                                    text: "自动清理规则";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                }
+
+                                Text {
+                                    text: "留空 = 不限制 · 添加备注的记录不会被自动清理";
+                                    color: #6e6e73;
+                                    font-size: 12px;
+                                }
+
+                                HorizontalLayout {
+                                    // 最大记录数
+                                    spacing: 10px;
+
+                                    Text {
+                                        text: "最大记录数";
+                                        color: #8e8e93;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                        width: 80px;
+                                    }
+
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: 38px;
+                                        border-radius: 10px;
+                                        background: #2c2c2e;
+                                        border-width: 1px;
+                                        border-color: #3a3a3c;
+
+                                        TextInput {
+                                            x: 14px;
+                                            width: parent.width - 28px;
+                                            height: 100%;
+                                            vertical-alignment: center;
+                                            text <=> root.max_history_input;
+                                            color: #f5f5f7;
+                                            font-size: 14px;
+                                            input-type: number;
+
+                                            key-pressed(event) => {
+                                                if event.text == Key.Return {
+                                                    root.apply_cleanup_rules();
+                                                    accept
+                                                } else {
+                                                    reject
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    // 最大保留天数
+                                    spacing: 10px;
+
+                                    Text {
+                                        text: "保留天数";
+                                        color: #8e8e93;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                        width: 80px;
+                                    }
+
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: 38px;
+                                        border-radius: 10px;
+                                        background: #2c2c2e;
+                                        border-width: 1px;
+                                        border-color: #3a3a3c;
+
+                                        TextInput {
+                                            x: 14px;
+                                            width: parent.width - 28px;
+                                            height: 100%;
+                                            vertical-alignment: center;
+                                            text <=> root.max_age_input;
+                                            color: #f5f5f7;
+                                            font-size: 14px;
+                                            input-type: number;
+
+                                            key-pressed(event) => {
+                                                if event.text == Key.Return {
+                                                    root.apply_cleanup_rules();
+                                                    accept
+                                                } else {
+                                                    reject
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    // 应用按钮
+                                    alignment: end;
+
+                                    Rectangle {
+                                        width: 80px;
+                                        height: 32px;
+                                        border-radius: 8px;
+                                        background: apply_rules_btn.has-hover ? #3a3a3c : #2c2c2e;
+                                        border-width: 1px;
+                                        border-color: #48484a;
+
+                                        apply_rules_btn := TouchArea {
+                                            clicked => {
+                                                root.apply_cleanup_rules();
+                                            }
+                                        }
+
+                                        Text {
+                                            text: "应用";
+                                            color: #aeaeb2;
+                                            font-size: 13px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                // 统计
+                                spacing: 10px;
+
+                                Text {
+                                    text: "统计";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                }
+
+                                HorizontalLayout {
+                                // 总条数 + 有备注条数
+                                    spacing: 10px;
+
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: 56px;
+                                        border-radius: 10px;
+                                        background: #2c2c2e;
+                                        border-width: 1px;
+                                        border-color: #3a3a3c;
+
+                                        VerticalLayout {
+                                            padding: 8px;
+                                            spacing: 2px;
+
+                                            Text {
+                                                text: "总条数";
+                                                color: #8e8e93;
+                                                font-size: 11px;
+                                            }
+
+                                            Text {
+                                                text: root.stat_total;
+                                                color: #f5f5f7;
+                                                font-size: 18px;
+                                                font-weight: 700;
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: 56px;
+                                        border-radius: 10px;
+                                        background: #2c2c2e;
+                                        border-width: 1px;
+                                        border-color: #3a3a3c;
+
+                                        VerticalLayout {
+                                            padding: 8px;
+                                            spacing: 2px;
+
+                                            Text {
+                                                text: "有备注";
+                                                color: #8e8e93;
+                                                font-size: 11px;
+                                            }
+
+                                            Text {
+                                                text: root.stat_marked;
+                                                color: #f5f5f7;
+                                                font-size: 18px;
+                                                font-weight: 700;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                // 各分类条数
+                                    spacing: 10px;
+
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: 56px;
+                                        border-radius: 10px;
+                                        background: #2c2c2e;
+                                        border-width: 1px;
+                                        border-color: #3a3a3c;
+
+                                        VerticalLayout {
+                                            padding: 8px;
+                                            spacing: 2px;
+
+                                            Text {
+                                                text: "文本";
+                                                color: #8e8e93;
+                                                font-size: 11px;
+                                            }
+
+                                            Text {
+                                                text: root.stat_text;
+                                                color: #f5f5f7;
+                                                font-size: 18px;
+                                                font-weight: 700;
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: 56px;
+                                        border-radius: 10px;
+                                        background: #2c2c2e;
+                                        border-width: 1px;
+                                        border-color: #3a3a3c;
+
+                                        VerticalLayout {
+                                            padding: 8px;
+                                            spacing: 2px;
+
+                                            Text {
+                                                text: "图片";
+                                                color: #8e8e93;
+                                                font-size: 11px;
+                                            }
+
+                                            Text {
+                                                text: root.stat_image;
+                                                color: #f5f5f7;
+                                                font-size: 18px;
+                                                font-weight: 700;
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: 56px;
+                                        border-radius: 10px;
+                                        background: #2c2c2e;
+                                        border-width: 1px;
+                                        border-color: #3a3a3c;
+
+                                        VerticalLayout {
+                                            padding: 8px;
+                                            spacing: 2px;
+
+                                            Text {
+                                                text: "文件";
+                                                color: #8e8e93;
+                                                font-size: 11px;
+                                            }
+
+                                            Text {
+                                                text: root.stat_files;
+                                                color: #f5f5f7;
+                                                font-size: 18px;
+                                                font-weight: 700;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                            // 手动清理
+                                spacing: 10px;
+
+                                Text {
+                                    text: "手动清理";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                }
+
+                                Rectangle {
+                                // 清空未标记记录
+                                    height: 38px;
+                                    border-radius: 10px;
+                                    background: clear_unnoted_btn.has-hover ? #3a3a3c : #2c2c2e;
+                                    border-width: 1px;
+                                    border-color: #48484a;
+
+                                    clear_unnoted_btn := TouchArea {
+                                        clicked => {
+                                            root.confirm_kind = "unnoted";
+                                            root.confirm_countdown = 2;
                                         }
                                     }
 
                                     Text {
-                                        text: "录制";
+                                        text: "清空未标记记录";
                                         color: #aeaeb2;
-                                        font-size: 13px;
+                                        font-size: 14px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Rectangle {
+                                // 清空全部记录（危险操作）
+                                    height: 38px;
+                                    border-radius: 10px;
+                                    background: clear_all_btn.has-hover ? #4a1a28 : #3a1520;
+                                    border-width: 1px;
+                                    border-color: #5a2030;
+
+                                    clear_all_btn := TouchArea {
+                                        clicked => {
+                                            root.confirm_kind = "all";
+                                            root.confirm_countdown = 2;
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "清空全部记录（含备注）";
+                                        color: #ff453a;
+                                        font-size: 14px;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
@@ -188,247 +600,16 @@ export component SettingsWindow inherits Window {
                             }
                         }
                     }
-
-                    // 开机自启
-                    HorizontalLayout {
-                        height: 32px;
-                        spacing: 8px;
-
-                        Text {
-                            text: "开机自启动";
-                            color: #aeaeb2;
-                            font-size: 13px;
-                            font-weight: 500;
-                            vertical-alignment: center;
-                        }
-
-                        Rectangle {
-                            horizontal-stretch: 1;
-                        }
-
-                        // 苹果风格开关
-                        Rectangle {
-                            width: 48px;
-                            height: 28px;
-                            y: (parent.height - self.height) / 2;
-                            border-radius: 14px;
-                            background: root.autostart_enabled ? #34c759 : #3a3a3c;
-
-                            autostart_toggle := TouchArea {
-                                clicked => {
-                                    root.toggle_autostart();
-                                }
-                            }
-
-                            Rectangle {
-                                x: root.autostart_enabled ? (parent.width - self.width - 3px) : 3px;
-                                y: 3px;
-                                width: 22px;
-                                height: 22px;
-                                border-radius: 11px;
-                                background: #ffffff;
-                            }
-                        }
-                    }
-
-                    // 自动清理规则
-                    VerticalLayout {
-                        spacing: 10px;
-
-                        Text {
-                            text: "自动清理规则";
-                            color: #aeaeb2;
-                            font-size: 13px;
-                            font-weight: 500;
-                        }
-
-                        Text {
-                            text: "留空 = 不限制 · 添加备注的记录不会被自动清理";
-                            color: #6e6e73;
-                            font-size: 12px;
-                        }
-
-                        // 最大记录数
-                        HorizontalLayout {
-                            spacing: 10px;
-
-                            Text {
-                                text: "最大记录数";
-                                color: #8e8e93;
-                                font-size: 13px;
-                                vertical-alignment: center;
-                                width: 80px;
-                            }
-
-                            Rectangle {
-                                horizontal-stretch: 1;
-                                height: 38px;
-                                border-radius: 10px;
-                                background: #2c2c2e;
-                                border-width: 1px;
-                                border-color: #3a3a3c;
-
-                                TextInput {
-                                    x: 14px;
-                                    width: parent.width - 28px;
-                                    height: 100%;
-                                    vertical-alignment: center;
-                                    text <=> root.max_history_input;
-                                    color: #f5f5f7;
-                                    font-size: 14px;
-                                    input-type: number;
-
-                                    key-pressed(event) => {
-                                        if event.text == Key.Return {
-                                            root.apply_cleanup_rules();
-                                            accept
-                                        } else {
-                                            reject
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // 最大保留天数
-                        HorizontalLayout {
-                            spacing: 10px;
-
-                            Text {
-                                text: "保留天数";
-                                color: #8e8e93;
-                                font-size: 13px;
-                                vertical-alignment: center;
-                                width: 80px;
-                            }
-
-                            Rectangle {
-                                horizontal-stretch: 1;
-                                height: 38px;
-                                border-radius: 10px;
-                                background: #2c2c2e;
-                                border-width: 1px;
-                                border-color: #3a3a3c;
-
-                                TextInput {
-                                    x: 14px;
-                                    width: parent.width - 28px;
-                                    height: 100%;
-                                    vertical-alignment: center;
-                                    text <=> root.max_age_input;
-                                    color: #f5f5f7;
-                                    font-size: 14px;
-                                    input-type: number;
-
-                                    key-pressed(event) => {
-                                        if event.text == Key.Return {
-                                            root.apply_cleanup_rules();
-                                            accept
-                                        } else {
-                                            reject
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // 应用按钮
-                        HorizontalLayout {
-                            alignment: end;
-
-                            Rectangle {
-                                width: 80px;
-                                height: 32px;
-                                border-radius: 8px;
-                                background: apply_rules_btn.has-hover ? #3a3a3c : #2c2c2e;
-                                border-width: 1px;
-                                border-color: #48484a;
-
-                                apply_rules_btn := TouchArea {
-                                    clicked => {
-                                        root.apply_cleanup_rules();
-                                    }
-                                }
-
-                                Text {
-                                    text: "应用";
-                                    color: #aeaeb2;
-                                    font-size: 13px;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-                    }
-
-                    // 手动清理
-                    VerticalLayout {
-                        spacing: 10px;
-
-                        Text {
-                            text: "手动清理";
-                            color: #aeaeb2;
-                            font-size: 13px;
-                            font-weight: 500;
-                        }
-
-                        // 清空未标记记录
-                        Rectangle {
-                            height: 38px;
-                            border-radius: 10px;
-                            background: clear_unnoted_btn.has-hover ? #3a3a3c : #2c2c2e;
-                            border-width: 1px;
-                            border-color: #48484a;
-
-                            clear_unnoted_btn := TouchArea {
-                                clicked => {
-                                    root.confirm_kind = "unnoted";
-                                    root.confirm_countdown = 2;
-                                }
-                            }
-
-                            Text {
-                                text: "清空未标记记录";
-                                color: #aeaeb2;
-                                font-size: 14px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        // 清空全部记录（危险操作）
-                        Rectangle {
-                            height: 38px;
-                            border-radius: 10px;
-                            background: clear_all_btn.has-hover ? #4a1a28 : #3a1520;
-                            border-width: 1px;
-                            border-color: #5a2030;
-
-                            clear_all_btn := TouchArea {
-                                clicked => {
-                                    root.confirm_kind = "all";
-                                    root.confirm_countdown = 2;
-                                }
-                            }
-
-                            Text {
-                                text: "清空全部记录（含备注）";
-                                color: #ff453a;
-                                font-size: 14px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
                 }
 
-                // 底部：更新与关于
                 VerticalLayout {
+                    // 底部：更新与关于
                     spacing: 10px;
                     alignment: end;
+                    vertical-stretch: 0;
 
-                    // 更新
-                    VerticalLayout {
+                    HorizontalLayout {
+                        // 更新
                         spacing: 10px;
 
                         Text {
@@ -436,6 +617,7 @@ export component SettingsWindow inherits Window {
                             color: #aeaeb2;
                             font-size: 13px;
                             font-weight: 500;
+                            vertical-alignment: center;
                         }
 
                         HorizontalLayout {
@@ -450,8 +632,8 @@ export component SettingsWindow inherits Window {
                                 overflow: elide;
                             }
 
-                            // 检查更新按钮
                             Rectangle {
+                            // 检查更新按钮
                                 width: 80px;
                                 height: 30px;
                                 border-radius: 8px;
@@ -575,9 +757,7 @@ export component SettingsWindow inherits Window {
                 x: 24px;
                 y: 24px;
                 width: parent.width - 48px;
-                text: root.confirm_kind == "all"
-                    ? "将清空全部记录（含备注），不可恢复，确认？"
-                    : "将清空所有未标记记录，确认？";
+                text: root.confirm_kind == "all" ? "将清空全部记录（含备注），不可恢复，确认？" : "将清空所有未标记记录，确认？";
                 color: #f5f5f7;
                 font-size: 14px;
                 horizontal-alignment: center;
@@ -616,9 +796,7 @@ export component SettingsWindow inherits Window {
                 y: 96px;
                 width: 110px;
                 height: 36px;
-                background: root.confirm_countdown > 0
-                    ? #3a1520
-                    : (ok_confirm_btn.has-hover ? #5a2030 : #4a1a28);
+                background: root.confirm_countdown > 0 ? #3a1520 : (ok_confirm_btn.has-hover ? #5a2030 : #4a1a28);
                 border-radius: 10px;
 
                 ok_confirm_btn := TouchArea {
@@ -629,9 +807,7 @@ export component SettingsWindow inherits Window {
                 }
 
                 Text {
-                    text: root.confirm_countdown > 0
-                        ? "确认 (" + root.confirm_countdown + "s)"
-                        : "确认";
+                    text: root.confirm_countdown > 0 ? "确认 (" + root.confirm_countdown + "s)" : "确认";
                     color: #ff453a;
                     font-size: 14px;
                     font-weight: 600;

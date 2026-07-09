@@ -52,6 +52,23 @@ pub fn open(
     window.set_confirm_countdown(0);
     window.set_about_version(SharedString::from(APP_VERSION));
 
+    // 加载统计到 UI
+    let refresh_stats: Rc<dyn Fn()> = Rc::new({
+        let storage = storage.clone();
+        let window_weak = window.as_weak();
+        move || {
+            let Some(w) = window_weak.upgrade() else { return };
+            if let Ok((total, marked, text, image, files)) = storage.borrow().stats() {
+                w.set_stat_total(total as i32);
+                w.set_stat_marked(marked as i32);
+                w.set_stat_text(text as i32);
+                w.set_stat_image(image as i32);
+                w.set_stat_files(files as i32);
+            }
+        }
+    });
+    refresh_stats();
+
     // 更新状态初始化：读取启动时后台检查的结果
     window.set_update_busy(false);
     if let Some(info) = update_info.lock().unwrap().as_ref() {
@@ -161,6 +178,7 @@ pub fn open(
     let storage_mh = storage.clone();
     let refresh_mh: Rc<dyn Fn()> = Rc::new(refresh_history);
     let refresh_for_apply = refresh_mh.clone();
+    let refresh_stats_for_apply = refresh_stats.clone();
     let window_weak = window.as_weak();
     window.on_apply_cleanup_rules(move || {
         let (history_input, age_input) = if let Some(w) = window_weak.upgrade() {
@@ -188,6 +206,7 @@ pub fn open(
         // 立即按规则清理一次
         let _ = storage_mh.borrow().purge_by_rule(max_count, max_age_days);
         refresh_for_apply();
+        refresh_stats_for_apply();
     });
 
     // 二次确认弹层：取消
@@ -202,6 +221,7 @@ pub fn open(
     // 二次确认弹层：确认（根据 confirm_kind 调用对应清理）
     let storage_confirm = storage.clone();
     let refresh_confirm = refresh_mh.clone();
+    let refresh_stats_confirm = refresh_stats.clone();
     let window_weak = window.as_weak();
     window.on_confirm_accept(move || {
         let kind = if let Some(w) = window_weak.upgrade() {
@@ -223,6 +243,7 @@ pub fn open(
             w.set_confirm_countdown(0);
         }
         refresh_confirm();
+        refresh_stats_confirm();
     });
 
     // 手动检查更新：后台执行，结果回传主线程更新 UI 并写入共享状态

@@ -527,6 +527,31 @@ impl Storage {
         Ok(())
     }
 
+    /// 统计剪贴板记录：总条数、各分类条数、有备注条数
+    /// 返回 (total, marked, text, image, files)
+    pub fn stats(&self) -> rusqlite::Result<(i64, i64, i64, i64, i64)> {
+        let protected = Self::protected_expr();
+        let sql = format!(
+            "SELECT
+                COUNT(*),
+                SUM(CASE WHEN ({protected}) THEN 1 ELSE 0 END),
+                SUM(CASE WHEN kind IN ('text','html','rtf') THEN 1 ELSE 0 END),
+                SUM(CASE WHEN kind = 'image' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN kind = 'files' THEN 1 ELSE 0 END)
+            FROM clipboard_items"
+        );
+        self.conn
+            .query_row(&sql, [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                ))
+            })
+    }
+
     /// 清空所有剪贴板历史记录，同时删除关联的 blob 文件及 blobs 目录下的孤儿文件
     pub fn clear_all(&self) -> rusqlite::Result<()> {
         self.conn.execute("DELETE FROM clipboard_items", [])?;

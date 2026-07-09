@@ -11,6 +11,8 @@ export struct HistoryItem {
     thumbnail: image,
     has_thumbnail: bool,
     blob_path: string,
+    // 类型标记文本：为空则不显示标签
+    tag_text: string,
 }
 
 // 分类元数据：由 Rust 侧填充，驱动按钮渲染与键盘循环
@@ -52,16 +54,18 @@ export component MainWindow inherits Window {
     in-out property <string> edit_note_text;
     in-out property <int> edit_note_id;
     in-out property <int> edit_note_row_index;
-    in-out property <int> hovered_id: -1;
-    in-out property <image> selected_full_image;
     callback open_edit_note(int);
-    callback item_hovered(int);
     callback edit_note_confirm(int, string);
     callback edit_note_cancel();
     callback edit_selected_note();
 
     // 打开设置面板
     callback open_settings();
+
+    // 固钉切换：打开后窗口保持显示，不自动隐藏
+    callback pin_toggled();
+
+    in-out property <bool> pinned;
 
     focus_search => {
         search_input.focus();
@@ -154,6 +158,31 @@ export component MainWindow inherits Window {
                     letter-spacing: -0.02rem;
                     vertical-alignment: center;
                     horizontal-alignment: left;
+                }
+
+                // 固钉按钮
+                Rectangle {
+                    x: parent.width - 108px;
+                    width: 36px;
+                    height: 36px;
+                    border-radius: 10px;
+                    background: pin_area.has-hover ? #3a3a3c : transparent;
+
+                    pin_area := TouchArea {
+                        clicked => {
+                            root.pinned = !root.pinned;
+                            root.pin_toggled();
+                        }
+                    }
+
+                    Image {
+                        x: 11px;
+                        y: 11px;
+                        width: 14px;
+                        height: 14px;
+                        colorize: root.pinned ? #f5f5f7 : #8e8e93;
+                        source: @image-url("../../assets/icons/pin.svg");
+                    }
                 }
 
                 // 设置按钮
@@ -348,7 +377,7 @@ export component MainWindow inherits Window {
                     spacing: 8px;
 
                     for item[index] in root.history: Rectangle {
-                        height: 85px;
+                        height: item.has_thumbnail ? 150px : 85px;
                         border-radius: 12px;
                         // 苹果风格：用微妙边框代替纯色块
                         border-width: 1px;
@@ -356,11 +385,6 @@ export component MainWindow inherits Window {
                         background: item.id == root.selected_id ? #007aff15 : (touch.has-hover ? #2c2c2e : #1c1c1e);
 
                         touch := TouchArea {
-                            pointer-event(event) => {
-                                if event.kind == PointerEventKind.move {
-                                    root.item_hovered(item.id);
-                                }
-                            }
                             clicked => {
                                 root.item_selected(item.id);
                             }
@@ -368,53 +392,88 @@ export component MainWindow inherits Window {
 
                         // 缩略图
                         if item.has_thumbnail: Rectangle {
-                            x: 10px;
-                            y: 7px;
-                            width: 66px;
-                            height: 66px;
+                            x: 3px;
+                            y: 3px;
+                            width: 300px - 6px;
+                            height: 150px - 6px;
                             border-radius: 8px;
                             clip: true;
                             background: #2c2c2e;
 
                             Image {
-                                width: 66px;
-                                height: 66px;
+                                width: 300px - 6px;
+                                height: 150px - 6px;
                                 source: item.thumbnail;
-                                image-fit: preserve;
+                                // source: item.blob_path;
+                                image-fit: cover;
                             }
                         }
 
-                        // 文本内容
-                        Rectangle {
-                            x: item.has_thumbnail ? 86px : 14px;
-                            y: 8px;
-                            width: parent.width - self.x - 48px;
-                            // height: parent.height - 16px;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 4px;
+                            alignment: space-between;
 
-                            VerticalLayout {
-                                spacing: 4px;
+                            // 标签与正文同一行：标签在前，正文跟随
+                            HorizontalLayout {
+                                spacing: 6px;
 
-                                Text {
-                                    text: item.text;
-                                    color: #f5f5f7;
-                                    font-size: 14px;
-                                    font-weight: 400;
-                                    horizontal-alignment: left;
-                                    vertical-alignment: top;
-                                    wrap: char-wrap;
-                                    overflow: clip;
-                                    height: 51px;
+                                // 类型标签：文件/图片项显示，与正文区分
+                                if item.tag_text != "": Rectangle {
+                                    height: 18px;
+                                    width: tag_label.preferred-width + 12px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 4px;
+                                    background: #0a84ff30;
+                                    border-width: 1px;
+                                    border-color: #0a84ff80;
+
+                                    tag_label := Text {
+                                        x: 6px;
+                                        text: item.tag_text;
+                                        color: #5ac8fa;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: left;
+                                    }
                                 }
 
-                                if item.note != "": Text {
-                                    text: item.note;
-                                    color: #6e6e73;
-                                    font-size: 12px;
-                                    horizontal-alignment: left;
-                                    vertical-alignment: top;
-                                    wrap: char-wrap;
+                                // 正文：图片项叠加在缩略图上，加紧贴文字的背景保证可读
+                                Rectangle {
                                     height: 20px;
-                                    overflow: clip;
+                                    width: body_text.preferred-width + 8px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 3px;
+                                    background: item.has_thumbnail ? #00000099 : transparent;
+                                    visible: item.text != "";
+
+                                    body_text := Text {
+                                        x: 4px;
+                                        text: item.text;
+                                        color: #f5f5f7;
+                                        font-size: 14px;
+                                        font-weight: 400;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: left;
+                                    }
+                                }
+                            }
+
+                            // 备注：图片项同样加背景
+                            if item.note != "": Rectangle {
+                                height: 20px;
+                                width: note_text.preferred-width + 8px;
+                                border-radius: 3px;
+                                background: item.has_thumbnail ? #00000099 : transparent;
+
+                                note_text := Text {
+                                    x: 4px;
+                                    text: item.note;
+                                    color: item.has_thumbnail ? #c7c7cc : #6e6e73;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: left;
                                 }
                             }
                         }
@@ -488,26 +547,6 @@ export component MainWindow inherits Window {
                     width: 100%;
                 }
             }
-        }
-    }
-
-    // 图片放大预览（选中图片项时显示在窗口右下角悬浮）
-    if root.selected_full_image.width > 0 && root.selected_full_image.height > 0: Rectangle {
-        x: root.width - 280px - 8px;
-        y: root.height - 280px - 32px;
-        width: 280px;
-        height: 280px;
-        border-radius: 14px;
-        background: #1c1c1e;
-        border-width: 1px;
-        border-color: #3a3a3c;
-        drop-shadow-blur: 8px;
-
-        Image {
-            width: 280px;
-            height: 280px;
-            source: root.selected_full_image;
-            image-fit: contain;
         }
     }
 

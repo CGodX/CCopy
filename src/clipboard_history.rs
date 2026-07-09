@@ -121,7 +121,8 @@ fn read_clipboard_item(ctx: &ClipboardContext) -> Option<ClipboardItem> {
         let _ = png.save_to_path(full_path.to_string_lossy().as_ref());
         let thumb_path = full_path.with_file_name(format!("{}.thumb.png", hash));
         if !thumb_path.exists() {
-            if let Ok(thumbnail) = image.thumbnail(66, 66) {
+            // 复用统一逻辑：小图保留原尺寸不放大，大图缩放到 300px
+            if let Some(thumbnail) = crate::filter::make_thumbnail(image) {
                 let _ = thumbnail.save_to_path(thumb_path.to_string_lossy().as_ref());
             }
         }

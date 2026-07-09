@@ -15,7 +15,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 
 use crate::clipboard_item::ClipboardItem;
-use crate::filter::{append_model, fill_model};
+use crate::filter::{append_model, ensure_thumbnail, fill_model, thumbnail_path};
 use crate::hotkey::HotkeyRegistrar;
 use crate::platform::PasteTarget;
 use crate::storage::Storage;
@@ -127,12 +127,89 @@ fn main() {
     let selected_category = Rc::new(RefCell::new(categories::DEFAULT_CATEGORY.to_string()));
     let selected_id = Rc::new(Cell::new(0));
 
+    // 异步缩略图加载：后台线程只做磁盘 IO（ensure_thumbnail），就绪后回传 id，
+    // 解码成 slint::Image 必须在主线程（slint::Image 非 Send）。
+    // 用取消令牌避免旧批次（切换分类/搜索）的结果覆盖新批次
+    let thumb_cancel: Arc<std::sync::atomic::AtomicBool> = Arc::new(false.into());
+    let (thumb_tx, thumb_rx) = mpsc::channel::<(i32, String)>();
+    let thumb_rx = Rc::new(RefCell::new(thumb_rx));
+    let history_model_for_thumb = history_model.clone();
+    let app_weak_for_thumb = app.as_weak();
+    let thumb_timer = Timer::default();
+    {
+        let thumb_rx = thumb_rx.clone();
+        let history_model_for_thumb = history_model_for_thumb.clone();
+        let app_weak_for_thumb = app_weak_for_thumb.clone();
+        thumb_timer.start(TimerMode::Repeated, std::time::Duration::from_millis(50), move || {
+            // 一次性取出当前所有就绪 id，批量解码后统一写入，减少重绘
+            let mut ready = Vec::new();
+            while let Ok(pair) = thumb_rx.borrow().try_recv() {
+                ready.push(pair);
+            }
+            if ready.is_empty() {
+                return;
+            }
+            let Some(app) = app_weak_for_thumb.upgrade() else { return };
+            let data_dir = crate::storage::data_dir();
+            // 构建 id->index 映射，避免每张图都全表线性查找
+            let model = app.get_history();
+            let mut idx_map: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+            for i in 0..model.row_count() {
+                if let Some(row) = model.row_data(i) {
+                    idx_map.insert(row.id, i);
+                }
+            }
+            for (id, blob_path) in ready {
+                let Some(&idx) = idx_map.get(&id) else { continue };
+                let Some(thumb_path) = thumbnail_path(&data_dir, &blob_path) else { continue };
+                // 主线程解码缩略图并写入对应行
+                if let Ok(img) = slint::Image::load_from_path(&thumb_path) {
+                    if let Some(mut row) = model.row_data(idx) {
+                        row.thumbnail = img;
+                        let _ = history_model_for_thumb.set_row_data(idx, row);
+                    }
+                }
+            }
+        });
+    }
+    std::mem::forget(thumb_timer);
+
+    let load_thumbnails_fn: Rc<dyn Fn(Vec<(i32, String)>)> = Rc::new({
+        let thumb_cancel = thumb_cancel.clone();
+        let thumb_tx = thumb_tx.clone();
+        move |pending: Vec<(i32, String)>| {
+            if pending.is_empty() {
+                return;
+            }
+            // 取消上一批次：翻转令牌，旧线程检测到即退出
+            thumb_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            let cancelled = thumb_cancel.clone();
+            thumb_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+            let tx = thumb_tx.clone();
+            let data_dir = crate::storage::data_dir();
+            std::thread::spawn(move || {
+                for (id, blob_path) in pending {
+                    if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    ensure_thumbnail(&data_dir, &blob_path);
+                    if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    // 只回传 id 与 blob_path，解码留在主线程
+                    let _ = tx.send((id, blob_path));
+                }
+            });
+        }
+    });
+
     // 首次加载第一页
     {
         if let Ok(items) = storage.borrow().query_items("", categories::DEFAULT_CATEGORY, PAGE_SIZE, 0) {
-            fill_model(&history_model, &items);
+            let pending = fill_model(&history_model, &items);
             loaded_count.set(items.len());
             has_more.set(items.len() == PAGE_SIZE);
+            load_thumbnails_fn.clone()(pending);
         }
     }
 
@@ -143,35 +220,10 @@ let last_shown = Rc::new(Cell::new(None::<Instant>));
 
 app.set_edit_note_id(-1);
 
-fn reset_selected_id(app: &MainWindow, selected_id: &Cell<i32>, storage: &Storage) {
+fn reset_selected_id(app: &MainWindow, selected_id: &Cell<i32>, _storage: &Storage) {
     let first = app.get_history().iter().next().map(|i| i.id).unwrap_or(0);
     selected_id.set(first);
     app.set_selected_id(first);
-    update_selected_full_image(app, first, storage);
-}
-
-fn update_selected_full_image(app: &MainWindow, id: i32, _storage: &Storage) {
-    // 直接从已加载的 model 取 blob_path，不再查数据库
-    let blob_path = app
-        .get_history()
-        .iter()
-        .find(|i| i.id == id)
-        .map(|i| i.blob_path.to_string())
-        .unwrap_or_default();
-    load_full_image_by_path(&app, &blob_path);
-}
-
-fn load_full_image_by_path(app: &MainWindow, blob_path: &str) {
-    if blob_path.is_empty() {
-        app.set_selected_full_image(slint::Image::default());
-        return;
-    }
-    let full_path = crate::storage::data_dir().join(blob_path);
-    // 同步加载：路径加载会解码图片，但通过调用方防抖避免连续切换时频繁触发
-    match slint::Image::load_from_path(&full_path) {
-        Ok(img) => app.set_selected_full_image(img),
-        Err(_) => app.set_selected_full_image(slint::Image::default()),
-    }
 }
 
 reset_selected_id(&app, &selected_id, &storage.borrow());
@@ -184,6 +236,8 @@ let reload_history: Rc<dyn Fn()> = Rc::new({
     let has_more = has_more.clone();
     let current_query = current_query.clone();
     let current_category = current_category.clone();
+    let load_thumbs = load_thumbnails_fn.clone();
+    let app_weak = app.as_weak();
     move || {
         let query = current_query.borrow().clone();
         let category = current_category.borrow().clone();
@@ -191,9 +245,13 @@ let reload_history: Rc<dyn Fn()> = Rc::new({
             .borrow()
             .query_items(&query, &category, PAGE_SIZE, 0)
         {
-            fill_model(&history_model, &items);
+            let pending = fill_model(&history_model, &items);
             loaded_count.set(items.len());
             has_more.set(items.len() == PAGE_SIZE);
+            // app 仍存活才回填缩略图
+            if app_weak.upgrade().is_some() {
+                load_thumbs(pending);
+            }
         }
     }
 });
@@ -333,9 +391,6 @@ app.on_search_changed(move |query| {
     let history_model_for_move = history_model.clone();
     let selected_id_for_move = selected_id.clone();
     let app_weak = app.as_weak();
-    // 防抖 Timer：长按连续切换时只加载最后停留项的图片，避免卡顿
-    let preview_timer = Rc::new(slint::Timer::default());
-    let preview_timer_for_move = preview_timer.clone();
     app.on_move_selection(move |delta| {
         // 从已加载的 model 读取可见项做键盘导航
         let visible: Vec<i32> = history_model_for_move
@@ -354,28 +409,25 @@ app.on_search_changed(move |query| {
         selected_id_for_move.set(id);
         if let Some(app) = app_weak.upgrade() {
             app.set_selected_id(id);
-            // 防抖：80ms 内连续切换只执行最后一次图片加载
-            let app_weak = app_weak.clone();
-            let model = history_model_for_move.clone();
-            preview_timer_for_move.start(
-                slint::TimerMode::SingleShot,
-                std::time::Duration::from_millis(80),
-                move || {
-                    if let Some(app) = app_weak.upgrade() {
-                        let blob_path = model
-                            .iter()
-                            .find(|i| i.id == id)
-                            .map(|i| i.blob_path.to_string())
-                            .unwrap_or_default();
-                        load_full_image_by_path(&app, &blob_path);
-                    }
-                },
-            );
-            const ITEM_H: f32 = 78.0;
-            const SPACING: f32 = 10.0;
-            const STEP: f32 = ITEM_H + SPACING;
-            let item_top = next as f32 * STEP;
-            let item_bottom = item_top + ITEM_H;
+            // 滚动确保选中项可见：图片项 150px，文本项 85px，间距 8px
+            const IMAGE_ITEM_H: f32 = 150.0;
+            const TEXT_ITEM_H: f32 = 85.0;
+            const SPACING: f32 = 8.0;
+            let has_thumb = history_model_for_move
+                .row_data(next)
+                .map(|r| r.has_thumbnail)
+                .unwrap_or(false);
+            let item_h = if has_thumb { IMAGE_ITEM_H } else { TEXT_ITEM_H };
+            // 累加前面所有项高度得到当前项顶部偏移
+            let mut item_top = 0.0;
+            for i in 0..next {
+                let h = history_model_for_move
+                    .row_data(i)
+                    .map(|r| if r.has_thumbnail { IMAGE_ITEM_H } else { TEXT_ITEM_H })
+                    .unwrap_or(TEXT_ITEM_H);
+                item_top += h + SPACING;
+            }
+            let item_bottom = item_top + item_h;
             let visible_h = app.get_visible_height() as f32;
             let mut vp = app.get_viewport_y() as f32;
             if item_top < -vp {
@@ -386,32 +438,6 @@ app.on_search_changed(move |query| {
             let max_vp = app.get_content_height() as f32 - visible_h;
             let vp = vp.min(0.0).max(-max_vp.max(0.0));
             app.set_viewport_y(vp);
-        }
-    });
-
-    // 鼠标悬浮时优先显示悬浮项的图片预览，离开后恢复选中项
-    let selected_id_for_hover = selected_id.clone();
-    let last_hover_id = Rc::new(Cell::new(-1));
-    let last_hover_id_for_cb = last_hover_id.clone();
-    let app_weak = app.as_weak();
-    app.on_item_hovered(move |id| {
-        // 只在 hover 的 id 变化时才加载图片，避免 move 事件频繁触发重复加载
-        if last_hover_id_for_cb.get() == id {
-            return;
-        }
-        last_hover_id_for_cb.set(id);
-        if let Some(app) = app_weak.upgrade() {
-            app.set_hovered_id(id);
-            // 从已加载的 model 取 blob_path，不再查数据库
-            let target_id = if id > 0 { id } else { selected_id_for_hover.get() };
-            let blob_path = app
-                .get_history()
-                .iter()
-                .find(|i| i.id == target_id)
-                .map(|i| i.blob_path.to_string())
-                .unwrap_or_default();
-            // 悬浮时直接加载（已有 last_hover_id 去重，不会频繁触发）
-            load_full_image_by_path(&app, &blob_path);
         }
     });
 
@@ -631,6 +657,7 @@ app.on_search_changed(move |query| {
     let loading_for_more = loading.clone();
     let current_query_for_more = current_query.clone();
     let current_category_for_more = current_category.clone();
+    let load_thumbs_for_more = load_thumbnails_fn.clone();
     app.on_load_more(move || {
         // 无更多数据或正在加载时跳过，防重复
         if !has_more_for_more.get() || loading_for_more.get() {
@@ -644,10 +671,12 @@ app.on_search_changed(move |query| {
             .borrow()
             .query_items(&query, &category, PAGE_SIZE, offset)
         {
-            append_model(&history_model_for_more, &items);
+            let pending = append_model(&history_model_for_more, &items);
             let new_count = offset + items.len();
             loaded_count_for_more.set(new_count);
             has_more_for_more.set(items.len() == PAGE_SIZE);
+            // 仅追加页的缩略图进后台队列，不影响已加载项
+            load_thumbs_for_more(pending);
         }
         loading_for_more.set(false);
     });
@@ -721,6 +750,9 @@ app.on_search_changed(move |query| {
     let open_for_btn = open_settings_fn.clone();
     app.on_open_settings(move || open_for_btn());
 
+    // 固钉切换：状态已由 UI 双向绑定，此处无需额外处理
+    app.on_pin_toggled(|| {});
+
     // 监听全局热键事件
     let app_weak = app.as_weak();
     let paste_target_for_hotkey = paste_target.clone();
@@ -739,8 +771,10 @@ app.on_search_changed(move |query| {
             }
         }
         // 窗口失去焦点自动隐藏（显示超过 250ms 且应用不在前台）
+        // 固钉模式下窗口保持显示，不自动隐藏
         if let Some(app) = app_weak.upgrade() {
-            if app.window().is_visible()
+            if !app.get_pinned()
+                && app.window().is_visible()
                 && last_shown_for_timer.get().is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(250))
                 && !crate::platform::is_app_foreground(&app)
             {

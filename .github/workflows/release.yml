@@ -20,10 +20,18 @@ jobs:
       - name: Build
         run: cargo packager --release --formats nsis
 
+      - name: 统一产物名前缀为大写 CCopy
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path "target/release" -Filter "*-setup.exe" | ForEach-Object {
+            $newName = "CCopy_" + ($_.Name -split '_', 2)[1]
+            Rename-Item -Path $_.FullName -NewName $newName
+          }
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ccopy-windows-x64
+          name: CCopy-windows-x64
           path: target/release/*-setup.exe
 
   build-macos:
@@ -43,7 +51,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ccopy-macos
+          name: CCopy-macos
           path: target/release/*.dmg
 
   release:
