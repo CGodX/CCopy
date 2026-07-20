@@ -1,6 +1,6 @@
 [package]
 name = "ccopy"
-version = "0.3.7"
+version = "0.4.0"
 edition = "2021"
 
 [package.metadata.packager]
@@ -23,6 +23,7 @@ opt-level = 0
 chrono = "0.4.45"
 clipboard-rs = { version = "0.3.4", features = ["image"] }
 global-hotkey = "0.8.0"
+http = "1.4.2"
 mouse_position = "0.1.4"
 raw-window-handle = "0.6"
 rusqlite = { version = "0.37.0", features = ["bundled"] }

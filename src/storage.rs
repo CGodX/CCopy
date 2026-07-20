@@ -328,6 +328,20 @@ impl Storage {
         Ok(items.into_iter().next())
     }
 
+    /// 按内容哈希查询记录：用于同步删除时定位本地 id
+    pub fn find_by_hash(&self, hash: &str) -> rusqlite::Result<Option<ClipboardItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, preview, text_content, plain_text, blob_path, format_name, mime_type,
+                   width, height, size_bytes, hash, note, created_at, updated_at, last_used_at
+            FROM clipboard_items
+            WHERE hash = ?1",
+        )?;
+        let mut rows = stmt.query(params![hash])?;
+        let mut items = Vec::new();
+        self.collect_items(&mut rows, &mut items)?;
+        Ok(items.into_iter().next())
+    }
+
     /// 从已 prepare 的 rows 收集 ClipboardItem（含 files），复用给多个查询方法
     fn collect_items(
         &self,

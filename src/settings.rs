@@ -8,9 +8,14 @@ use slint::{ComponentHandle, SharedString};
 
 use crate::hotkey::{HotkeyRegistrar, HotkeySpec};
 use crate::storage::Storage;
+use crate::sync::{self, SharedCoordinator};
 use crate::ui::SettingsWindow;
 use crate::updater::{CheckResult, UpdateInfo};
-use crate::{SETTING_HOTKEY, SETTING_MAX_AGE_DAYS, SETTING_MAX_HISTORY};
+use crate::{
+    SETTING_HOTKEY, SETTING_MAX_AGE_DAYS, SETTING_MAX_HISTORY, SETTING_SYNC_DEVICE_NAME,
+    SETTING_SYNC_ENABLED, SETTING_SYNC_IMAGE_ENABLED, SETTING_SYNC_PASSWORD,
+    SETTING_SYNC_RETAIN_MONTHS, SETTING_SYNC_URL, SETTING_SYNC_USERNAME,
+};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -25,6 +30,7 @@ pub fn open(
     window_ref: Rc<RefCell<Option<SettingsWindow>>>,
     refresh_history: impl Fn() + 'static,
     update_info: Arc<Mutex<Option<UpdateInfo>>>,
+    sync_coordinator: Rc<RefCell<Option<SharedCoordinator>>>,
 ) {
     // 已打开则聚焦，不重复创建
     if window_ref.borrow().is_some() {
@@ -51,6 +57,20 @@ pub fn open(
     window.set_confirm_kind(SharedString::from(""));
     window.set_confirm_countdown(0);
     window.set_about_version(SharedString::from(APP_VERSION));
+
+    // 默认显示通用 tab
+    window.set_active_tab(0);
+
+    // 从存储加载同步配置（未配置时用默认值）
+    window.set_sync_enabled(load_sync_enabled(&storage));
+    window.set_sync_url(SharedString::from(load_sync_url(&storage)));
+    window.set_sync_username(SharedString::from(load_sync_username(&storage)));
+    window.set_sync_password(SharedString::from(load_sync_password(&storage)));
+    window.set_sync_device_name(SharedString::from(load_sync_device_name(&storage)));
+    window.set_sync_image_enabled(load_sync_image_enabled(&storage));
+    window.set_sync_retain_months(SharedString::from(load_sync_retain_months_display(&storage)));
+    window.set_sync_status(SharedString::from(""));
+    window.set_sync_password_visible(false);
 
     // 加载统计到 UI
     let refresh_stats: Rc<dyn Fn()> = Rc::new({
@@ -207,6 +227,153 @@ pub fn open(
         let _ = storage_mh.borrow().purge_by_rule(max_count, max_age_days);
         refresh_for_apply();
         refresh_stats_for_apply();
+    });
+
+    // 同步配置应用：写入存储后重建协调器
+    let storage_sync = storage.clone();
+    let sync_coord_for_apply = sync_coordinator.clone();
+    let window_weak = window.as_weak();
+    window.on_apply_sync_config(move || {
+        let Some(w) = window_weak.upgrade() else { return };
+        let s = storage_sync.borrow();
+        let _ = s.set_setting(
+            SETTING_SYNC_ENABLED,
+            if w.get_sync_enabled() { "1" } else { "0" },
+        );
+        let _ = s.set_setting(SETTING_SYNC_URL, w.get_sync_url().as_str());
+        let _ = s.set_setting(SETTING_SYNC_USERNAME, w.get_sync_username().as_str());
+        let _ = s.set_setting(SETTING_SYNC_PASSWORD, w.get_sync_password().as_str());
+        let _ = s.set_setting(SETTING_SYNC_DEVICE_NAME, w.get_sync_device_name().as_str());
+        let _ = s.set_setting(
+            SETTING_SYNC_IMAGE_ENABLED,
+            if w.get_sync_image_enabled() { "1" } else { "0" },
+        );
+        // 保留期：空值按默认 3 处理，避免存入空串
+        let retain = w.get_sync_retain_months().to_string();
+        let retain_val = if retain.trim().is_empty() {
+            "3".to_string()
+        } else {
+            retain.trim().to_string()
+        };
+        let _ = s.set_setting(SETTING_SYNC_RETAIN_MONTHS, &retain_val);
+        drop(s);
+        // 重建协调器：配置变更后用新配置重新构建
+        let new_coord = sync::build_coordinator(sync::config::SyncConfig::load(&storage_sync));
+        *sync_coord_for_apply.borrow_mut() = new_coord;
+        // 状态反馈
+        if let Some(w) = window_weak.upgrade() {
+            if w.get_sync_enabled() {
+                w.set_sync_status(SharedString::from("配置已保存"));
+            } else {
+                w.set_sync_status(SharedString::from("同步未启用"));
+            }
+        }
+    });
+
+    // 立即同步：触发一次推送+拉取，结果通过 Arc 缓冲由短期 Timer 回主线程应用
+    let sync_coord_for_now = sync_coordinator.clone();
+    let storage_for_now = storage.clone();
+    let window_weak = window.as_weak();
+    window.on_sync_now(move || {
+        let coord = match sync_coord_for_now.borrow().as_ref() {
+            Some(c) => c.clone(),
+            None => {
+                if let Some(w) = window_weak.upgrade() {
+                    w.set_sync_status(SharedString::from("同步未启用"));
+                }
+                return;
+            }
+        };
+        if let Some(w) = window_weak.upgrade() {
+            w.set_sync_status(SharedString::from("同步中…"));
+        }
+        // 先推送待发事件
+        sync::spawn_flush(coord.clone());
+        // 后台拉取，结果写入 Arc 缓冲
+        let buf: Arc<Mutex<Option<Result<Vec<sync::event::SyncEvent>, String>>>> =
+            Arc::new(Mutex::new(None));
+        let buf_for_thread = buf.clone();
+        sync::spawn_pull(coord.clone(), move |result| {
+            *buf_for_thread.lock().unwrap() = Some(result);
+        });
+        // 短期 Timer：主线程轮询缓冲，拿到结果后 apply + 更新 UI + 自停
+        let storage_for_check = storage_for_now.clone();
+        let coord_for_check = coord;
+        let window_weak_for_check = window_weak.clone();
+        let check_timer = Rc::new(slint::Timer::default());
+        let check_timer_for_closure = check_timer.clone();
+        check_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(500),
+            move || {
+                let taken = buf.lock().unwrap().take();
+                let Some(result) = taken else { return };
+                // 拿到结果，停止轮询
+                let win = window_weak_for_check.upgrade();
+                match result {
+                    Err(e) => {
+                        if let Some(w) = &win {
+                            w.set_sync_status(SharedString::from(format!("同步失败: {e}")));
+                        }
+                    }
+                    Ok(events) => {
+                        let count = events.len();
+                        let applied = {
+                            let storage = storage_for_check.borrow();
+                            let c = coord_for_check.lock().unwrap();
+                            c.apply_events(&storage, events)
+                        };
+                        if let Some(w) = &win {
+                            w.set_sync_status(SharedString::from(format!(
+                                "已同步（拉取 {}，应用 {}，删除 {}）",
+                                count, applied.applied, applied.deleted
+                            )));
+                        }
+                    }
+                }
+                check_timer_for_closure.stop();
+            },
+        );
+    });
+
+    // 打开外部链接：调用系统默认浏览器
+    window.on_open_url(|url| {
+        let url = url.to_string();
+        #[cfg(target_os = "windows")]
+        {
+            use std::ffi::OsStr;
+            use std::os::windows::ffi::OsStrExt;
+            extern "system" {
+                fn ShellExecuteW(
+                    hwnd: *mut std::ffi::c_void,
+                    op: *const u16,
+                    file: *const u16,
+                    params: *const u16,
+                    dir: *const u16,
+                    show: i32,
+                ) -> *mut std::ffi::c_void;
+            }
+            const SW_SHOWNORMAL: i32 = 1;
+            let to_wide = |s: &str| -> Vec<u16> {
+                OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+            };
+            let op = to_wide("open");
+            let file = to_wide(&url);
+            unsafe {
+                ShellExecuteW(
+                    std::ptr::null_mut(),
+                    op.as_ptr(),
+                    file.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    SW_SHOWNORMAL,
+                );
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = url;
+        }
     });
 
     // 二次确认弹层：取消
@@ -375,6 +542,99 @@ pub fn load_max_age_value(storage: &Rc<RefCell<Storage>>) -> usize {
         .unwrap_or(0)
 }
 
+// ===== 同步配置加载/保存 =====
+
+/// 从存储加载同步开关（未设置默认 false）
+pub fn load_sync_enabled(storage: &Rc<RefCell<Storage>>) -> bool {
+    storage
+        .borrow()
+        .get_setting(SETTING_SYNC_ENABLED)
+        .ok()
+        .flatten()
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+pub fn load_sync_url(storage: &Rc<RefCell<Storage>>) -> String {
+    storage
+        .borrow()
+        .get_setting(SETTING_SYNC_URL)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+pub fn load_sync_username(storage: &Rc<RefCell<Storage>>) -> String {
+    storage
+        .borrow()
+        .get_setting(SETTING_SYNC_USERNAME)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+pub fn load_sync_password(storage: &Rc<RefCell<Storage>>) -> String {
+    storage
+        .borrow()
+        .get_setting(SETTING_SYNC_PASSWORD)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// 设备名：未设置时取主机名并存回（保证后续读取稳定）
+pub fn load_sync_device_name(storage: &Rc<RefCell<Storage>>) -> String {
+    if let Some(name) = storage
+        .borrow()
+        .get_setting(SETTING_SYNC_DEVICE_NAME)
+        .ok()
+        .flatten()
+    {
+        return name;
+    }
+    let name = default_device_name();
+    let _ = storage
+        .borrow()
+        .set_setting(SETTING_SYNC_DEVICE_NAME, &name);
+    name
+}
+
+pub fn load_sync_image_enabled(storage: &Rc<RefCell<Storage>>) -> bool {
+    storage
+        .borrow()
+        .get_setting(SETTING_SYNC_IMAGE_ENABLED)
+        .ok()
+        .flatten()
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// 保留期显示文本（0 显示为空，未设置默认 3）
+pub fn load_sync_retain_months_display(storage: &Rc<RefCell<Storage>>) -> String {
+    storage
+        .borrow()
+        .get_setting(SETTING_SYNC_RETAIN_MONTHS)
+        .ok()
+        .flatten()
+        .and_then(|s| {
+            let v: usize = s.parse().ok()?;
+            if v == 0 { None } else { Some(s) }
+        })
+        .unwrap_or_else(|| "3".to_string())
+}
+
+/// 保留期数值（未设置默认 3）
+#[allow(dead_code)]
+pub fn load_sync_retain_months_value(storage: &Rc<RefCell<Storage>>) -> usize {
+    storage
+        .borrow()
+        .get_setting(SETTING_SYNC_RETAIN_MONTHS)
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
+}
+
 /// 把 Slint Key 文本归一化为小写主键名
 fn normalize_key(text: &str) -> String {
     let k = text.trim().to_lowercase();
@@ -382,6 +642,29 @@ fn normalize_key(text: &str) -> String {
         "return" => "enter".into(),
         _ => k,
     }
+}
+
+/// 默认设备名：取主机名，失败时回退 "ccopy-pc"
+fn default_device_name() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        extern "system" {
+            fn GetComputerNameW(lpBuffer: *mut u16, nSize: *mut u32) -> i32;
+        }
+        unsafe {
+            let mut size: u32 = 0;
+            // 第一次调用获取所需长度
+            GetComputerNameW(std::ptr::null_mut(), &mut size as *mut u32);
+            let mut buf = vec![0u16; size as usize];
+            if GetComputerNameW(buf.as_mut_ptr(), &mut size as *mut u32) != 0 {
+                let os = OsString::from_wide(&buf[..size as usize]);
+                return os.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "ccopy-pc".to_string()
 }
 
 

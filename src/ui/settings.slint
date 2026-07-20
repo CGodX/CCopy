@@ -39,6 +39,21 @@ export component SettingsWindow inherits Window {
     // 统计：文件条数
     in-out property <int> stat_files;
 
+    // 当前激活的 tab：0=通用 1=清理 2=同步
+    in-out property <int> active_tab;
+
+    // 同步配置（阶段二联动，先占位）
+    in-out property <bool> sync_enabled;
+    in-out property <string> sync_url;
+    in-out property <string> sync_username;
+    in-out property <string> sync_password;
+    in-out property <string> sync_device_name;
+    in-out property <bool> sync_image_enabled;
+    in-out property <string> sync_retain_months;
+    in-out property <string> sync_status;
+    // 密码是否明文显示
+    in-out property <bool> sync_password_visible;
+
     callback close_requested();
     // 手动检查更新
     callback check_update();
@@ -52,6 +67,12 @@ export component SettingsWindow inherits Window {
     callback toggle_autostart();
     // 应用自动清理规则（最大记录数 + 最大保留天数）
     callback apply_cleanup_rules();
+
+    // 同步配置变更回调（阶段二接入）
+    callback apply_sync_config();
+    callback sync_now();
+    // 打开外部链接（浏览器）
+    callback open_url(string);
 
     // 二次确认弹层：当前无弹层、待确认清空未标记、待确认清空全部
     in-out property <string> confirm_kind; // "" / "unnoted" / "all"
@@ -101,7 +122,7 @@ export component SettingsWindow inherits Window {
 
             VerticalLayout {
                 padding: 20px;
-                spacing: 20px;
+                spacing: 16px;
 
                 // 标题栏
                 Rectangle {
@@ -141,10 +162,92 @@ export component SettingsWindow inherits Window {
                     }
                 }
 
+                // Tab 栏：分段控件
+                Rectangle {
+                    height: 36px;
+                    border-radius: 10px;
+                    background: #2c2c2e;
+                    border-width: 1px;
+                    border-color: #3a3a3c;
+
+                    HorizontalLayout {
+                        padding: 3px;
+                        spacing: 3px;
+
+                        tab-general := Rectangle {
+                            horizontal-stretch: 1;
+                            height: 30px;
+                            border-radius: 8px;
+                            background: root.active_tab == 0 ? #3a3a3c : transparent;
+
+                            TouchArea {
+                                clicked => {
+                                    root.active_tab = 0;
+                                }
+                            }
+
+                            Text {
+                                text: "通用";
+                                color: root.active_tab == 0 ? #f5f5f7 : #8e8e93;
+                                font-size: 13px;
+                                font-weight: root.active_tab == 0 ? 600 : 400;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        tab-cleanup := Rectangle {
+                            horizontal-stretch: 1;
+                            height: 30px;
+                            border-radius: 8px;
+                            background: root.active_tab == 1 ? #3a3a3c : transparent;
+
+                            TouchArea {
+                                clicked => {
+                                    root.active_tab = 1;
+                                }
+                            }
+
+                            Text {
+                                text: "清理";
+                                color: root.active_tab == 1 ? #f5f5f7 : #8e8e93;
+                                font-size: 13px;
+                                font-weight: root.active_tab == 1 ? 600 : 400;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        tab-sync := Rectangle {
+                            horizontal-stretch: 1;
+                            height: 30px;
+                            border-radius: 8px;
+                            background: root.active_tab == 2 ? #3a3a3c : transparent;
+
+                            TouchArea {
+                                clicked => {
+                                    root.active_tab = 2;
+                                }
+                            }
+
+                            Text {
+                                text: "同步";
+                                color: root.active_tab == 2 ? #f5f5f7 : #8e8e93;
+                                font-size: 13px;
+                                font-weight: root.active_tab == 2 ? 600 : 400;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                // 内容区
                 Rectangle {
                     vertical-stretch: 1;
 
-                    ScrollView {
+                    // ===== 通用 Tab =====
+                    if root.active_tab == 0: ScrollView {
                         x: 0;
                         y: 0;
                         width: 100%;
@@ -252,134 +355,10 @@ export component SettingsWindow inherits Window {
                                 }
                             }
 
-                            VerticalLayout {
-                                // 自动清理规则
-                                spacing: 10px;
-
-                                Text {
-                                    text: "自动清理规则";
-                                    color: #aeaeb2;
-                                    font-size: 13px;
-                                    font-weight: 500;
-                                }
-
-                                Text {
-                                    text: "留空 = 不限制 · 添加备注的记录不会被自动清理";
-                                    color: #6e6e73;
-                                    font-size: 12px;
-                                }
-
-                                HorizontalLayout {
-                                    // 最大记录数
-                                    spacing: 10px;
-
-                                    Text {
-                                        text: "最大记录数";
-                                        color: #8e8e93;
-                                        font-size: 13px;
-                                        vertical-alignment: center;
-                                        width: 80px;
-                                    }
-
-                                    Rectangle {
-                                        horizontal-stretch: 1;
-                                        height: 38px;
-                                        border-radius: 10px;
-                                        background: #2c2c2e;
-                                        border-width: 1px;
-                                        border-color: #3a3a3c;
-
-                                        TextInput {
-                                            x: 14px;
-                                            width: parent.width - 28px;
-                                            height: 100%;
-                                            vertical-alignment: center;
-                                            text <=> root.max_history_input;
-                                            color: #f5f5f7;
-                                            font-size: 14px;
-                                            input-type: number;
-
-                                            key-pressed(event) => {
-                                                if event.text == Key.Return {
-                                                    root.apply_cleanup_rules();
-                                                    accept
-                                                } else {
-                                                    reject
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                HorizontalLayout {
-                                    // 最大保留天数
-                                    spacing: 10px;
-
-                                    Text {
-                                        text: "保留天数";
-                                        color: #8e8e93;
-                                        font-size: 13px;
-                                        vertical-alignment: center;
-                                        width: 80px;
-                                    }
-
-                                    Rectangle {
-                                        horizontal-stretch: 1;
-                                        height: 38px;
-                                        border-radius: 10px;
-                                        background: #2c2c2e;
-                                        border-width: 1px;
-                                        border-color: #3a3a3c;
-
-                                        TextInput {
-                                            x: 14px;
-                                            width: parent.width - 28px;
-                                            height: 100%;
-                                            vertical-alignment: center;
-                                            text <=> root.max_age_input;
-                                            color: #f5f5f7;
-                                            font-size: 14px;
-                                            input-type: number;
-
-                                            key-pressed(event) => {
-                                                if event.text == Key.Return {
-                                                    root.apply_cleanup_rules();
-                                                    accept
-                                                } else {
-                                                    reject
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                HorizontalLayout {
-                                    // 应用按钮
-                                    alignment: end;
-
-                                    Rectangle {
-                                        width: 80px;
-                                        height: 32px;
-                                        border-radius: 8px;
-                                        background: apply_rules_btn.has-hover ? #3a3a3c : #2c2c2e;
-                                        border-width: 1px;
-                                        border-color: #48484a;
-
-                                        apply_rules_btn := TouchArea {
-                                            clicked => {
-                                                root.apply_cleanup_rules();
-                                            }
-                                        }
-
-                                        Text {
-                                            text: "应用";
-                                            color: #aeaeb2;
-                                            font-size: 13px;
-                                            horizontal-alignment: center;
-                                            vertical-alignment: center;
-                                        }
-                                    }
-                                }
+                            Rectangle {
+                                // 分隔线
+                                height: 1px;
+                                background: #2c2c2e;
                             }
 
                             VerticalLayout {
@@ -540,7 +519,259 @@ export component SettingsWindow inherits Window {
                             }
 
                             VerticalLayout {
-                            // 手动清理
+                            // 更新
+                                spacing: 10px;
+
+                                Text {
+                                    text: "更新";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+
+                                    Text {
+                                        text: root.update_status;
+                                        color: #6e6e73;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+
+                                    Rectangle {
+                                    // 检查更新按钮
+                                        width: 80px;
+                                        height: 30px;
+                                        border-radius: 8px;
+                                        background: check_btn.has-hover ? #3a3a3c : #2c2c2e;
+                                        border-width: 1px;
+                                        border-color: #48484a;
+
+                                        check_btn := TouchArea {
+                                            enabled: !root.update_busy;
+                                            clicked => {
+                                                root.check_update();
+                                            }
+                                        }
+
+                                        Text {
+                                            text: "检查更新";
+                                            color: root.update_busy ? #48484a : #aeaeb2;
+                                            font-size: 12px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    // 立即更新按钮
+                                    if root.update_available: Rectangle {
+                                        width: 80px;
+                                        height: 30px;
+                                        border-radius: 8px;
+                                        background: do_update_btn.has-hover ? #2e8dff : #007aff;
+
+                                        do_update_btn := TouchArea {
+                                            enabled: !root.update_busy;
+                                            clicked => {
+                                                root.do_update(root.update_url);
+                                            }
+                                        }
+
+                                        Text {
+                                            text: "立即更新";
+                                            color: #ffffff;
+                                            font-size: 12px;
+                                            font-weight: 600;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                // 分隔线
+                                height: 1px;
+                                background: #2c2c2e;
+                            }
+
+                            // 关于
+                            HorizontalLayout {
+                                spacing: 8px;
+
+                                Text {
+                                    text: "CCopy " + root.about_version;
+                                    color: #6e6e73;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                }
+
+                                Text {
+                                    text: "轻量级剪贴板历史工具";
+                                    color: #48484a;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    // ===== 清理 Tab =====
+                    if root.active_tab == 1: ScrollView {
+                        x: 0;
+                        y: 0;
+                        width: 100%;
+                        height: 100%;
+
+                        VerticalLayout {
+                            spacing: 20px;
+                            alignment: start;
+
+                            VerticalLayout {
+                                // 自动清理规则
+                                spacing: 10px;
+
+                                Text {
+                                    text: "自动清理规则";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                }
+
+                                Text {
+                                    text: "留空 = 不限制 · 添加备注的记录不会被自动清理";
+                                    color: #6e6e73;
+                                    font-size: 12px;
+                                }
+
+                                HorizontalLayout {
+                                    // 最大记录数
+                                    spacing: 10px;
+
+                                    Text {
+                                        text: "最大记录数";
+                                        color: #8e8e93;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                        width: 80px;
+                                    }
+
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: 38px;
+                                        border-radius: 10px;
+                                        background: #2c2c2e;
+                                        border-width: 1px;
+                                        border-color: #3a3a3c;
+
+                                        TextInput {
+                                            x: 14px;
+                                            width: parent.width - 28px;
+                                            height: 100%;
+                                            vertical-alignment: center;
+                                            text <=> root.max_history_input;
+                                            color: #f5f5f7;
+                                            font-size: 14px;
+                                            input-type: number;
+
+                                            key-pressed(event) => {
+                                                if event.text == Key.Return {
+                                                    root.apply_cleanup_rules();
+                                                    accept
+                                                } else {
+                                                    reject
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    // 最大保留天数
+                                    spacing: 10px;
+
+                                    Text {
+                                        text: "保留天数";
+                                        color: #8e8e93;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                        width: 80px;
+                                    }
+
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: 38px;
+                                        border-radius: 10px;
+                                        background: #2c2c2e;
+                                        border-width: 1px;
+                                        border-color: #3a3a3c;
+
+                                        TextInput {
+                                            x: 14px;
+                                            width: parent.width - 28px;
+                                            height: 100%;
+                                            vertical-alignment: center;
+                                            text <=> root.max_age_input;
+                                            color: #f5f5f7;
+                                            font-size: 14px;
+                                            input-type: number;
+
+                                            key-pressed(event) => {
+                                                if event.text == Key.Return {
+                                                    root.apply_cleanup_rules();
+                                                    accept
+                                                } else {
+                                                    reject
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    // 应用按钮
+                                    alignment: end;
+
+                                    Rectangle {
+                                        width: 80px;
+                                        height: 32px;
+                                        border-radius: 8px;
+                                        background: apply_rules_btn.has-hover ? #3a3a3c : #2c2c2e;
+                                        border-width: 1px;
+                                        border-color: #48484a;
+
+                                        apply_rules_btn := TouchArea {
+                                            clicked => {
+                                                root.apply_cleanup_rules();
+                                            }
+                                        }
+
+                                        Text {
+                                            text: "应用";
+                                            color: #aeaeb2;
+                                            font-size: 13px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                // 分隔线
+                                height: 1px;
+                                background: #2c2c2e;
+                            }
+
+                            VerticalLayout {
+                                // 手动清理
                                 spacing: 10px;
 
                                 Text {
@@ -600,115 +831,382 @@ export component SettingsWindow inherits Window {
                             }
                         }
                     }
-                }
 
-                VerticalLayout {
-                    // 底部：更新与关于
-                    spacing: 10px;
-                    alignment: end;
-                    vertical-stretch: 0;
+                    // ===== 同步 Tab =====
+                    if root.active_tab == 2: ScrollView {
+                        x: 0;
+                        y: 0;
+                        width: 100%;
+                        height: 100%;
 
-                    HorizontalLayout {
-                        // 更新
-                        spacing: 10px;
+                        VerticalLayout {
+                            spacing: 16px;
+                            alignment: start;
 
-                        Text {
-                            text: "更新";
-                            color: #aeaeb2;
-                            font-size: 13px;
-                            font-weight: 500;
-                            vertical-alignment: center;
-                        }
+                            HorizontalLayout {
+                                // 启用同步
+                                height: 32px;
+                                spacing: 8px;
 
-                        HorizontalLayout {
-                            spacing: 8px;
+                                Text {
+                                    text: "启用同步";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    vertical-alignment: center;
+                                }
 
-                            Text {
-                                text: root.update_status;
-                                color: #6e6e73;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                                overflow: elide;
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                }
+
+                                Rectangle {
+                                    width: 48px;
+                                    height: 28px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 14px;
+                                    background: root.sync_enabled ? #34c759 : #3a3a3c;
+
+                                    sync_toggle := TouchArea {
+                                        clicked => {
+                                            root.sync_enabled = !root.sync_enabled;
+                                            root.apply_sync_config();
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        x: root.sync_enabled ? (parent.width - self.width - 3px) : 3px;
+                                        y: 3px;
+                                        width: 22px;
+                                        height: 22px;
+                                        border-radius: 11px;
+                                        background: #ffffff;
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                // WebDAV 地址
+                                spacing: 8px;
+
+                                Text {
+                                    text: "WebDAV 地址";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                }
+
+                                Rectangle {
+                                    height: 38px;
+                                    border-radius: 10px;
+                                    background: #2c2c2e;
+                                    border-width: 1px;
+                                    border-color: #3a3a3c;
+
+                                    TextInput {
+                                        x: 14px;
+                                        width: parent.width - 28px;
+                                        height: 100%;
+                                        vertical-alignment: center;
+                                        text <=> root.sync_url;
+                                        color: #f5f5f7;
+                                        font-size: 14px;
+                                    }
+                                }
+
+                                // 示例地址：靠右，点击打开浏览器
+                                Rectangle {
+                                    height: 16px;
+                                    width: 100%;
+
+                                    url_example := TouchArea {
+                                        clicked => {
+                                            root.open_url("https://help.jianguoyun.com/?p=2064");
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "示例：https://dav.jianguoyun.com/dav/CCopy";
+                                        color: url_example.has-hover ? #007aff : #6e6e73;
+                                        font-size: 11px;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                        width: 100%;
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                // 用户名
+                                spacing: 8px;
+
+                                Text {
+                                    text: "用户名";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                }
+
+                                Rectangle {
+                                    height: 38px;
+                                    border-radius: 10px;
+                                    background: #2c2c2e;
+                                    border-width: 1px;
+                                    border-color: #3a3a3c;
+
+                                    TextInput {
+                                        x: 14px;
+                                        width: parent.width - 28px;
+                                        height: 100%;
+                                        vertical-alignment: center;
+                                        text <=> root.sync_username;
+                                        color: #f5f5f7;
+                                        font-size: 14px;
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                // 密码
+                                spacing: 8px;
+
+                                Text {
+                                    text: "密码";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                }
+
+                                Rectangle {
+                                    height: 38px;
+                                    border-radius: 10px;
+                                    background: #2c2c2e;
+                                    border-width: 1px;
+                                    border-color: #3a3a3c;
+
+                                    // 隐藏态：密码遮罩
+                                    if !root.sync_password_visible: TextInput {
+                                        x: 14px;
+                                        width: parent.width - 60px;
+                                        height: 100%;
+                                        vertical-alignment: center;
+                                        text <=> root.sync_password;
+                                        color: #f5f5f7;
+                                        font-size: 14px;
+                                        input-type: password;
+                                    }
+
+                                    // 显示态：明文
+                                    if root.sync_password_visible: TextInput {
+                                        x: 14px;
+                                        width: parent.width - 60px;
+                                        height: 100%;
+                                        vertical-alignment: center;
+                                        text <=> root.sync_password;
+                                        color: #f5f5f7;
+                                        font-size: 14px;
+                                    }
+
+                                    // 显隐切换按钮（图标）
+                                    Rectangle {
+                                        x: parent.width - 42px;
+                                        y: (parent.height - 26px) / 2;
+                                        width: 30px;
+                                        height: 26px;
+                                        border-radius: 6px;
+                                        background: pwd_toggle.has-hover ? #3a3a3c : transparent;
+
+                                        pwd_toggle := TouchArea {
+                                            clicked => {
+                                                root.sync_password_visible = !root.sync_password_visible;
+                                            }
+                                        }
+
+                                        Image {
+                                            x: (parent.width - 14px) / 2;
+                                            y: (parent.height - 14px) / 2;
+                                            width: 14px;
+                                            height: 14px;
+                                            colorize: #8e8e93;
+                                            source: root.sync_password_visible
+                                                ? @image-url("../../assets/icons/eye-off.svg")
+                                                : @image-url("../../assets/icons/eye.svg");
+                                        }
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                // 设备名
+                                spacing: 8px;
+
+                                Text {
+                                    text: "设备名";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                }
+
+                                Rectangle {
+                                    height: 38px;
+                                    border-radius: 10px;
+                                    background: #2c2c2e;
+                                    border-width: 1px;
+                                    border-color: #3a3a3c;
+
+                                    TextInput {
+                                        x: 14px;
+                                        width: parent.width - 28px;
+                                        height: 100%;
+                                        vertical-alignment: center;
+                                        text <=> root.sync_device_name;
+                                        color: #f5f5f7;
+                                        font-size: 14px;
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                // 图片同步开关
+                                height: 32px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: "同步图片";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    vertical-alignment: center;
+                                }
+
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                }
+
+                                Rectangle {
+                                    width: 48px;
+                                    height: 28px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 14px;
+                                    background: root.sync_image_enabled ? #34c759 : #3a3a3c;
+
+                                    sync_img_toggle := TouchArea {
+                                        clicked => {
+                                            root.sync_image_enabled = !root.sync_image_enabled;
+                                            root.apply_sync_config();
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        x: root.sync_image_enabled ? (parent.width - self.width - 3px) : 3px;
+                                        y: 3px;
+                                        width: 22px;
+                                        height: 22px;
+                                        border-radius: 11px;
+                                        background: #ffffff;
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                // 保留期
+                                spacing: 8px;
+
+                                Text {
+                                    text: "保留期（月）";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                }
+
+                                Rectangle {
+                                    height: 38px;
+                                    border-radius: 10px;
+                                    background: #2c2c2e;
+                                    border-width: 1px;
+                                    border-color: #3a3a3c;
+
+                                    TextInput {
+                                        x: 14px;
+                                        width: parent.width - 28px;
+                                        height: 100%;
+                                        vertical-alignment: center;
+                                        text <=> root.sync_retain_months;
+                                        color: #f5f5f7;
+                                        font-size: 14px;
+                                        input-type: number;
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                // 应用 + 立即同步
+                                spacing: 10px;
+                                alignment: end;
+
+                                Rectangle {
+                                    width: 80px;
+                                    height: 32px;
+                                    border-radius: 8px;
+                                    background: apply_sync_btn.has-hover ? #3a3a3c : #2c2c2e;
+                                    border-width: 1px;
+                                    border-color: #48484a;
+
+                                    apply_sync_btn := TouchArea {
+                                        clicked => {
+                                            root.apply_sync_config();
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "应用";
+                                        color: #aeaeb2;
+                                        font-size: 13px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 90px;
+                                    height: 32px;
+                                    border-radius: 8px;
+                                    background: sync_now_btn.has-hover ? #2e8dff : #007aff;
+
+                                    sync_now_btn := TouchArea {
+                                        clicked => {
+                                            root.sync_now();
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "立即同步";
+                                        color: #ffffff;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
                             }
 
                             Rectangle {
-                            // 检查更新按钮
-                                width: 80px;
-                                height: 30px;
+                                // 状态指示
+                                height: 32px;
                                 border-radius: 8px;
-                                background: check_btn.has-hover ? #3a3a3c : #2c2c2e;
+                                background: #2c2c2e;
                                 border-width: 1px;
-                                border-color: #48484a;
-
-                                check_btn := TouchArea {
-                                    enabled: !root.update_busy;
-                                    clicked => {
-                                        root.check_update();
-                                    }
-                                }
+                                border-color: #3a3a3c;
 
                                 Text {
-                                    text: "检查更新";
-                                    color: root.update_busy ? #48484a : #aeaeb2;
+                                    text: root.sync_status == "" ? "未连接" : root.sync_status;
+                                    color: #6e6e73;
                                     font-size: 12px;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
+                                    width: 100%;
                                 }
                             }
-
-                            // 立即更新按钮
-                            if root.update_available: Rectangle {
-                                width: 80px;
-                                height: 30px;
-                                border-radius: 8px;
-                                background: do_update_btn.has-hover ? #2e8dff : #007aff;
-
-                                do_update_btn := TouchArea {
-                                    enabled: !root.update_busy;
-                                    clicked => {
-                                        root.do_update(root.update_url);
-                                    }
-                                }
-
-                                Text {
-                                    text: "立即更新";
-                                    color: #ffffff;
-                                    font-size: 12px;
-                                    font-weight: 600;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-                    }
-
-                    // 分隔
-                    Rectangle {
-                        height: 1px;
-                        background: #2c2c2e;
-                    }
-
-                    // 关于
-                    HorizontalLayout {
-                        spacing: 8px;
-
-                        Text {
-                            text: "CCopy " + root.about_version;
-                            color: #6e6e73;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
-
-                        Rectangle {
-                            horizontal-stretch: 1;
-                        }
-
-                        Text {
-                            text: "轻量级剪贴板历史工具";
-                            color: #48484a;
-                            font-size: 12px;
-                            vertical-alignment: center;
                         }
                     }
                 }

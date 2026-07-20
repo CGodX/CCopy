@@ -32,6 +32,7 @@ mod hotkey;
 mod platform;
 mod settings;
 mod storage;
+mod sync;
 mod tray;
 mod ui;
 mod updater;
@@ -42,6 +43,15 @@ pub use ui::*;
 pub const SETTING_HOTKEY: &str = "hotkey";
 pub const SETTING_MAX_HISTORY: &str = "max_history";
 pub const SETTING_MAX_AGE_DAYS: &str = "max_age_days";
+
+/// 同步相关设置项键名
+pub const SETTING_SYNC_ENABLED: &str = "sync_enabled";
+pub const SETTING_SYNC_URL: &str = "sync_url";
+pub const SETTING_SYNC_USERNAME: &str = "sync_username";
+pub const SETTING_SYNC_PASSWORD: &str = "sync_password";
+pub const SETTING_SYNC_DEVICE_NAME: &str = "sync_device_name";
+pub const SETTING_SYNC_IMAGE_ENABLED: &str = "sync_image_enabled";
+pub const SETTING_SYNC_RETAIN_MONTHS: &str = "sync_retain_months";
 
 /// 单实例检测：通过命名互斥体保证程序只能运行一个实例
 /// 返回 true 表示这是唯一实例，可以继续运行；返回 false 表示已有实例在运行
@@ -212,6 +222,11 @@ fn main() {
             load_thumbnails_fn.clone()(pending);
         }
     }
+
+// 同步协调器：配置可用时构建，apply_sync_config 后重建
+// 用 Rc<RefCell<Option<...>>> 包裹：None 表示同步未启用
+let sync_coordinator: Rc<RefCell<Option<sync::SharedCoordinator>>> =
+    Rc::new(RefCell::new(sync::build_coordinator(sync::config::SyncConfig::load(&storage))));
 
 let ignore_next_clipboard_change = Rc::new(Cell::new(false));
 let paste_target = Rc::new(Cell::new(None));
@@ -489,6 +504,7 @@ app.on_search_changed(move |query| {
     let app_weak = app.as_weak();
     let history_model_for_note = history_model.clone();
     let storage_for_note = storage.clone();
+    let sync_for_note = sync_coordinator.clone();
     app.on_edit_note_confirm(move |id, note_text| {
         let note = if note_text.is_empty() {
             None
@@ -507,6 +523,13 @@ app.on_search_changed(move |query| {
                     );
                     history_model_for_note.set_row_data(idx, new_row);
                     break;
+                }
+            }
+            // 同步推送：备注变更生成全量快照事件
+            if let Some(item) = storage_for_note.borrow().get_item(id as i64).ok().flatten() {
+                if let Some(coord) = sync_for_note.borrow().as_ref() {
+                    coord.lock().unwrap().push_upsert(&item);
+                    sync::spawn_flush(coord.clone());
                 }
             }
         }
@@ -596,7 +619,15 @@ app.on_search_changed(move |query| {
     let history_model_for_delete = history_model.clone();
     let storage_for_delete = storage.clone();
     let loaded_count_for_delete = loaded_count.clone();
+    let sync_for_delete = sync_coordinator.clone();
     app.on_item_deleted(move |id| {
+        // 删前查 hash，用于同步推送 delete 事件
+        let hash_opt = storage_for_delete
+            .borrow()
+            .get_item(id as i64)
+            .ok()
+            .flatten()
+            .map(|i| i.hash);
         let _ = storage_for_delete.borrow_mut().delete_item(id as i64);
         // 从 model 移除对应行，不重置分页
         for idx in 0..history_model_for_delete.row_count() {
@@ -609,6 +640,13 @@ app.on_search_changed(move |query| {
                 break;
             }
         }
+        // 同步推送 delete 事件
+        if let Some(hash) = hash_opt {
+            if let Some(coord) = sync_for_delete.borrow().as_ref() {
+                coord.lock().unwrap().push_delete(&hash);
+                sync::spawn_flush(coord.clone());
+            }
+        }
     });
 
     let (tx, rx) = mpsc::channel();
@@ -618,6 +656,7 @@ app.on_search_changed(move |query| {
     let max_history_for_cb = max_history.clone();
     let max_age_for_cb = max_age_days.clone();
     let reload_for_cb = reload_history.clone();
+    let sync_for_cb = sync_coordinator.clone();
     let rx = std::rc::Rc::new(std::cell::RefCell::new(rx));
     let watcher_timer = slint::Timer::default();
     watcher_timer.start(
@@ -643,6 +682,11 @@ app.on_search_changed(move |query| {
                 if upserted.is_ok() {
                     // 刷新第一页（新条目排在最前）
                     reload_for_cb();
+                    // 同步推送：生成全量快照事件并入队，后台线程上传
+                    if let Some(coord) = sync_for_cb.borrow().as_ref() {
+                        coord.lock().unwrap().push_upsert(&item);
+                        sync::spawn_flush(coord.clone());
+                    }
                 }
             }
         },
@@ -720,6 +764,7 @@ app.on_search_changed(move |query| {
         let max_age_days = max_age_days.clone();
         let reload_history = reload_history.clone();
         let update_info = update_info.clone();
+        let sync_coord = sync_coordinator.clone();
         let app_weak = app.as_weak();
         move || {
             let app = app_weak.clone();
@@ -732,6 +777,7 @@ app.on_search_changed(move |query| {
             let max_age_days = max_age_days.clone();
             let reload_history = reload_history.clone();
             let update_info = update_info.clone();
+            let sync_coord = sync_coord.clone();
             let storage_for_refresh = storage.clone();
             let refresh = move || {
                 max_history.set(settings::load_max_history_value(&storage_for_refresh));
@@ -742,7 +788,7 @@ app.on_search_changed(move |query| {
                     reset_selected_id(&app, &selected_id, &storage_for_refresh.borrow());
                 }
             };
-            settings::open(storage, registrar, hotkey_id, settings_ref, refresh, update_info);
+            settings::open(storage, registrar, hotkey_id, settings_ref, refresh, update_info, sync_coord);
         }
     });
 
@@ -796,6 +842,71 @@ app.on_search_changed(move |query| {
                 *update_info.lock().unwrap() = Some(info);
             }
         });
+    }
+
+    // 同步定时拉取：每 5 秒触发，后台下载合并，主线程下次 tick 落库
+    // 用 Arc<Mutex<Option<Result>>> 在后台线程和主线程间传递，避免 Rc 跨线程
+    {
+        let sync_for_pull = sync_coordinator.clone();
+        let storage_for_pull = storage.clone();
+        let reload_for_pull = reload_history.clone();
+        // 待应用事件缓冲：后台线程写入，主线程消费
+        let pending_events: Arc<Mutex<Option<Result<Vec<sync::event::SyncEvent>, String>>>> =
+            Arc::new(Mutex::new(None));
+        // 拉取节流：上次拉取未完成则跳过
+        let pulling = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pull_timer = Timer::default();
+        pull_timer.start(
+            TimerMode::Repeated,
+            std::time::Duration::from_secs(5),
+            move || {
+                // 先消费上次拉取结果（主线程落库）
+                let events_opt = pending_events.lock().unwrap().take();
+                if let Some(result) = events_opt {
+                    pulling.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(events) = result {
+                        if !events.is_empty() {
+                            let applied = {
+                                let storage = storage_for_pull.borrow();
+                                if let Some(coord) = sync_for_pull.borrow().as_ref() {
+                                    let c = coord.lock().unwrap();
+                                    c.apply_events(&storage, events)
+                                } else {
+                                    sync::PullStats::default()
+                                }
+                            };
+                            if applied.applied > 0 || applied.deleted > 0 {
+                                reload_for_pull();
+                            }
+                        }
+                    }
+                }
+                // 发起下一次拉取（后台线程，结果写入 pending_events）
+                if pulling.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return; // 上次还在拉
+                }
+                let coord = match sync_for_pull.borrow().as_ref() {
+                    Some(c) => c.clone(),
+                    None => {
+                        pulling.store(false, std::sync::atomic::Ordering::SeqCst);
+                        return;
+                    }
+                };
+                let buf = pending_events.clone();
+                sync::spawn_pull(coord, move |result| {
+                    *buf.lock().unwrap() = Some(result);
+                });
+            },
+        );
+        std::mem::forget(pull_timer);
+    }
+
+    // 启动后延迟清理一次过期同步归档
+    {
+        let coord = sync_coordinator.borrow().as_ref().cloned();
+        if let Some(c) = coord {
+            sync::spawn_cleanup(c);
+        }
     }
 
     let _keep_alive = (registrar, timer);
