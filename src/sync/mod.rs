@@ -36,7 +36,16 @@ pub struct SyncCoordinator {
     etag_cache: Arc<Mutex<HashMap<String, String>>>,
     /// 待推送的事件队列：后台线程消费
     pending: Arc<Mutex<Vec<SyncEvent>>>,
+    /// 已创建的目录集合：避免重复 MKCOL
+    dir_created: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// 限流退避截止时间戳（毫秒）：此时间前跳过所有网络请求
+    backoff_until: Arc<std::sync::atomic::AtomicI64>,
 }
+
+/// 默认拉取间隔（秒）
+pub const PULL_INTERVAL_SECS: u64 = 60;
+/// 限流退避时长（秒）
+const BACKOFF_SECS: i64 = 120;
 
 impl SyncCoordinator {
     /// 构造协调器：配置必须可用（调用方先判断 is_usable）
@@ -49,6 +58,26 @@ impl SyncCoordinator {
             device_name,
             etag_cache: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(Vec::new())),
+            dir_created: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            backoff_until: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        }
+    }
+
+    /// 是否处于限流退避期
+    fn in_backoff(&self) -> bool {
+        now_millis() < self.backoff_until.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 标记限流退避：错误信息含限流特征时，延长退避时间
+    fn maybe_backoff(&self, err: &str) {
+        let limited = err.contains("Too many requests")
+            || err.contains("BlockedTemporarily")
+            || err.contains("HTTP 429")
+            || err.contains("HTTP 503");
+        if limited {
+            let until = now_millis() + BACKOFF_SECS * 1000;
+            self.backoff_until
+                .store(until, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -74,9 +103,27 @@ impl SyncCoordinator {
         }
     }
 
+    /// 确保目录存在（带缓存）：已创建过的目录不重复 MKCOL
+    fn ensure_dir_cached(&self, rel: &str) -> Result<(), String> {
+        {
+            let cache = self.dir_created.lock().map_err(|e| format!("锁失败: {e}"))?;
+            if cache.contains(rel) {
+                return Ok(());
+            }
+        }
+        self.client.ensure_dir(rel)?;
+        if let Ok(mut cache) = self.dir_created.lock() {
+            cache.insert(rel.to_string());
+        }
+        Ok(())
+    }
+
     /// 执行一次推送：把待推送事件追加到 WebDAV 本月 jsonl
-    /// 在后台线程调用
+    /// 在后台线程调用。限流退避期间跳过，事件保留在队列里下次重试
     pub fn flush_push(&self) -> Result<(), String> {
+        if self.in_backoff() {
+            return Ok(()); // 退避中，事件留在队列
+        }
         let events: Vec<SyncEvent> = {
             let mut q = self.pending.lock().map_err(|e| format!("锁失败: {e}"))?;
             std::mem::take(&mut *q)
@@ -84,9 +131,22 @@ impl SyncCoordinator {
         if events.is_empty() {
             return Ok(());
         }
-        // 确保设备目录存在
+        // 执行推送，失败时把事件放回队列并触发退避
+        if let Err(e) = self.do_flush_push(&events) {
+            self.maybe_backoff(&e);
+            // 事件放回队列尾部，下次重试
+            if let Ok(mut q) = self.pending.lock() {
+                q.extend(events);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// 实际推送逻辑：确保目录、读旧内容、追加、PUT
+    fn do_flush_push(&self, events: &[SyncEvent]) -> Result<(), String> {
         let device_dir = format!("{DEVICES_DIR}/{}", self.device_name);
-        self.client.ensure_dir(&device_dir)?;
+        self.ensure_dir_cached(&device_dir)?;
         // 读取本月文件已有内容
         let month = current_month();
         let rel = format!("{device_dir}/{month}.jsonl");
@@ -95,8 +155,7 @@ impl SyncCoordinator {
             Err(_) => String::new(), // 文件不存在
         };
         // 追加新事件（图片项需先上传图片）
-        for ev in &events {
-            // 图片同步：开启时上传图片到 images/<hash>.png，事件 blob_path 改为该相对路径
+        for ev in events {
             let ev_to_write = if self.config.image_enabled {
                 self.maybe_upload_image(ev)?
             } else {
@@ -143,9 +202,25 @@ impl SyncCoordinator {
 
     /// 执行一次拉取：列所有设备文件，增量下载，合并出待应用事件
     /// 仅做网络与合并，不碰 storage（在后台线程调用）
+    /// 限流退避期间返回空列表，调用方据此跳过
     pub fn pull_collect(&self) -> Result<Vec<SyncEvent>, String> {
-        // 确保 devices 目录存在
-        self.client.ensure_dir(DEVICES_DIR)?;
+        if self.in_backoff() {
+            return Ok(Vec::new());
+        }
+        // 执行拉取，限流错误时触发退避
+        match self.do_pull_collect() {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.maybe_backoff(&e);
+                Err(e)
+            }
+        }
+    }
+
+    /// 实际拉取逻辑
+    fn do_pull_collect(&self) -> Result<Vec<SyncEvent>, String> {
+        // 确保 devices 目录存在（带缓存）
+        self.ensure_dir_cached(DEVICES_DIR)?;
         // 列 devices 目录，获取各设备子目录
         let device_dirs = self.client.list(DEVICES_DIR)?;
         let mut all_events: Vec<SyncEvent> = Vec::new();

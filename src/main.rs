@@ -529,7 +529,6 @@ app.on_search_changed(move |query| {
             if let Some(item) = storage_for_note.borrow().get_item(id as i64).ok().flatten() {
                 if let Some(coord) = sync_for_note.borrow().as_ref() {
                     coord.lock().unwrap().push_upsert(&item);
-                    sync::spawn_flush(coord.clone());
                 }
             }
         }
@@ -644,7 +643,6 @@ app.on_search_changed(move |query| {
         if let Some(hash) = hash_opt {
             if let Some(coord) = sync_for_delete.borrow().as_ref() {
                 coord.lock().unwrap().push_delete(&hash);
-                sync::spawn_flush(coord.clone());
             }
         }
     });
@@ -682,10 +680,9 @@ app.on_search_changed(move |query| {
                 if upserted.is_ok() {
                     // 刷新第一页（新条目排在最前）
                     reload_for_cb();
-                    // 同步推送：生成全量快照事件并入队，后台线程上传
+                    // 同步推送：事件入队，由推送定时器统一 flush（合并短时间多次复制）
                     if let Some(coord) = sync_for_cb.borrow().as_ref() {
                         coord.lock().unwrap().push_upsert(&item);
-                        sync::spawn_flush(coord.clone());
                     }
                 }
             }
@@ -844,7 +841,26 @@ app.on_search_changed(move |query| {
         });
     }
 
-    // 同步定时拉取：每 5 秒触发，后台下载合并，主线程下次 tick 落库
+    // 同步推送定时器：每 10 秒 flush 一次待推送队列
+    // 合并短时间内的多次复制/删除，减少 WebDAV 请求
+    {
+        let sync_for_push = sync_coordinator.clone();
+        let push_timer = Timer::default();
+        push_timer.start(
+            TimerMode::Repeated,
+            std::time::Duration::from_secs(10),
+            move || {
+                let coord = match sync_for_push.borrow().as_ref() {
+                    Some(c) => c.clone(),
+                    None => return,
+                };
+                sync::spawn_flush(coord);
+            },
+        );
+        std::mem::forget(push_timer);
+    }
+
+    // 同步定时拉取：默认 60 秒触发，后台下载合并，主线程下次 tick 落库
     // 用 Arc<Mutex<Option<Result>>> 在后台线程和主线程间传递，避免 Rc 跨线程
     {
         let sync_for_pull = sync_coordinator.clone();
@@ -858,7 +874,7 @@ app.on_search_changed(move |query| {
         let pull_timer = Timer::default();
         pull_timer.start(
             TimerMode::Repeated,
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(sync::PULL_INTERVAL_SECS),
             move || {
                 // 先消费上次拉取结果（主线程落库）
                 let events_opt = pending_events.lock().unwrap().take();
