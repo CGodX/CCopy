@@ -47,7 +47,6 @@ export component SettingsWindow inherits Window {
     in-out property <string> sync_url;
     in-out property <string> sync_username;
     in-out property <string> sync_password;
-    in-out property <string> sync_device_name;
     in-out property <bool> sync_image_enabled;
     in-out property <bool> sync_marked_only;
     in-out property <string> sync_retain_months;
@@ -72,6 +71,7 @@ export component SettingsWindow inherits Window {
     // 同步配置变更回调（阶段二接入）
     callback apply_sync_config();
     callback sync_now();
+    callback test_connection();
     // 打开外部链接（浏览器）
     callback open_url(string);
 
@@ -81,6 +81,14 @@ export component SettingsWindow inherits Window {
     in-out property <int> confirm_countdown;
     callback confirm_cancel();
     callback confirm_accept();
+
+    // Toast 通知：show_toast 回调触发，toast_message/toast_visible 驱动浮层显示
+    // toast_kind: "info" | "success" | "error"，控制颜色
+    callback show_toast(string, string);
+    in-out property <string> toast_message;
+    in-out property <string> toast_kind;
+    in-out property <bool> toast_visible;
+    property <length> toast_timer;
 
     focus_scope := FocusScope {
         key-pressed(event) => {
@@ -256,7 +264,6 @@ export component SettingsWindow inherits Window {
 
                         VerticalLayout {
                             spacing: 20px;
-                            alignment: start;
 
                             VerticalLayout {
                                 // 快捷键
@@ -594,10 +601,15 @@ export component SettingsWindow inherits Window {
                             }
 
                             Rectangle {
+                                vertical-stretch: 1;
+                            }
+
+                            Rectangle {
                                 // 分隔线
                                 height: 1px;
                                 background: #2c2c2e;
                             }
+
 
                             // 关于
                             HorizontalLayout {
@@ -890,11 +902,31 @@ export component SettingsWindow inherits Window {
                                 // WebDAV 地址
                                 spacing: 8px;
 
-                                Text {
-                                    text: "WebDAV 地址";
-                                    color: #aeaeb2;
-                                    font-size: 13px;
-                                    font-weight: 500;
+                                HorizontalLayout {
+                                    Text {
+                                        text: "WebDAV 地址";
+                                        color: #aeaeb2;
+                                        font-size: 13px;
+                                        font-weight: 500;
+                                    }
+
+                                    // 示例地址：靠右，点击打开浏览器
+                                    Rectangle {
+                                        height: 16px;
+                                        width: 100%;
+
+                                        url_example := TouchArea {
+                                            clicked => {
+                                                root.open_url("https://help.jianguoyun.com/?p=2064");
+                                            }
+                                        }
+
+                                        Text {
+                                            text: "示例：https://dav.jianguoyun.com/dav/CCopy";
+                                            color: url_example.has-hover ? #007aff : #6e6e73;
+                                            font-size: 11px;
+                                        }
+                                    }
                                 }
 
                                 Rectangle {
@@ -912,27 +944,6 @@ export component SettingsWindow inherits Window {
                                         text <=> root.sync_url;
                                         color: #f5f5f7;
                                         font-size: 14px;
-                                    }
-                                }
-
-                                // 示例地址：靠右，点击打开浏览器
-                                Rectangle {
-                                    height: 16px;
-                                    width: 100%;
-
-                                    url_example := TouchArea {
-                                        clicked => {
-                                            root.open_url("https://help.jianguoyun.com/?p=2064");
-                                        }
-                                    }
-
-                                    Text {
-                                        text: "示例：https://dav.jianguoyun.com/dav/CCopy";
-                                        color: url_example.has-hover ? #007aff : #6e6e73;
-                                        font-size: 11px;
-                                        horizontal-alignment: right;
-                                        vertical-alignment: center;
-                                        width: 100%;
                                     }
                                 }
                             }
@@ -1029,83 +1040,62 @@ export component SettingsWindow inherits Window {
                                             width: 14px;
                                             height: 14px;
                                             colorize: #8e8e93;
-                                            source: root.sync_password_visible
-                                                ? @image-url("../../assets/icons/eye-off.svg")
-                                                : @image-url("../../assets/icons/eye.svg");
+                                            source: root.sync_password_visible ? @image-url("../../assets/icons/eye-off.svg") : @image-url("../../assets/icons/eye.svg");
                                         }
                                     }
                                 }
                             }
 
+                            // 仅同步标记内容开关（默认开启，大幅减少流量）
+                            // 仅控制文本类，图片由「同步图片」开关独立控制
                             VerticalLayout {
-                                // 设备名
-                                spacing: 8px;
+                                spacing: 2px;
 
-                                Text {
-                                    text: "设备名";
-                                    color: #aeaeb2;
-                                    font-size: 13px;
-                                    font-weight: 500;
-                                }
+                                HorizontalLayout {
+                                    height: 32px;
+                                    spacing: 8px;
 
-                                Rectangle {
-                                    height: 38px;
-                                    border-radius: 10px;
-                                    background: #2c2c2e;
-                                    border-width: 1px;
-                                    border-color: #3a3a3c;
-
-                                    TextInput {
-                                        x: 14px;
-                                        width: parent.width - 28px;
-                                        height: 100%;
+                                    Text {
+                                        text: "仅同步标记内容";
+                                        color: #aeaeb2;
+                                        font-size: 13px;
+                                        font-weight: 500;
                                         vertical-alignment: center;
-                                        text <=> root.sync_device_name;
-                                        color: #f5f5f7;
-                                        font-size: 14px;
-                                    }
-                                }
-                            }
-
-                            HorizontalLayout {
-                                // 仅同步标记内容开关（默认开启，大幅减少流量）
-                                height: 32px;
-                                spacing: 8px;
-
-                                Text {
-                                    text: "仅同步标记内容";
-                                    color: #aeaeb2;
-                                    font-size: 13px;
-                                    font-weight: 500;
-                                    vertical-alignment: center;
-                                }
-
-                                Rectangle {
-                                    horizontal-stretch: 1;
-                                }
-
-                                Rectangle {
-                                    width: 48px;
-                                    height: 28px;
-                                    y: (parent.height - self.height) / 2;
-                                    border-radius: 14px;
-                                    background: root.sync_marked_only ? #34c759 : #3a3a3c;
-
-                                    sync_marked_toggle := TouchArea {
-                                        clicked => {
-                                            root.sync_marked_only = !root.sync_marked_only;
-                                            root.apply_sync_config();
-                                        }
                                     }
 
                                     Rectangle {
-                                        x: root.sync_marked_only ? (parent.width - self.width - 3px) : 3px;
-                                        y: 3px;
-                                        width: 22px;
-                                        height: 22px;
-                                        border-radius: 11px;
-                                        background: #ffffff;
+                                        horizontal-stretch: 1;
                                     }
+
+                                    Rectangle {
+                                        width: 48px;
+                                        height: 28px;
+                                        y: (parent.height - self.height) / 2;
+                                        border-radius: 14px;
+                                        background: root.sync_marked_only ? #34c759 : #3a3a3c;
+
+                                        sync_marked_toggle := TouchArea {
+                                            clicked => {
+                                                root.sync_marked_only = !root.sync_marked_only;
+                                                root.apply_sync_config();
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            x: root.sync_marked_only ? (parent.width - self.width - 3px) : 3px;
+                                            y: 3px;
+                                            width: 22px;
+                                            height: 22px;
+                                            border-radius: 11px;
+                                            background: #ffffff;
+                                        }
+                                    }
+                                }
+
+                                Text {
+                                    text: "开启后文本类需有备注才同步，图片不受此限制";
+                                    color: #636366;
+                                    font-size: 11px;
                                 }
                             }
 
@@ -1183,7 +1173,7 @@ export component SettingsWindow inherits Window {
                             }
 
                             HorizontalLayout {
-                                // 应用 + 立即同步
+                                // 应用 + 测试连接 + 立即同步
                                 spacing: 10px;
                                 alignment: end;
 
@@ -1214,6 +1204,29 @@ export component SettingsWindow inherits Window {
                                     width: 90px;
                                     height: 32px;
                                     border-radius: 8px;
+                                    background: test_conn_btn.has-hover ? #3a5a3a : #2a4a2a;
+                                    border-width: 1px;
+                                    border-color: #34c759;
+
+                                    test_conn_btn := TouchArea {
+                                        clicked => {
+                                            root.test_connection();
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "测试连接";
+                                        color: #34c759;
+                                        font-size: 13px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 90px;
+                                    height: 32px;
+                                    border-radius: 8px;
                                     background: sync_now_btn.has-hover ? #2e8dff : #007aff;
 
                                     sync_now_btn := TouchArea {
@@ -1233,23 +1246,23 @@ export component SettingsWindow inherits Window {
                                 }
                             }
 
-                            Rectangle {
-                                // 状态指示
-                                height: 32px;
-                                border-radius: 8px;
-                                background: #2c2c2e;
-                                border-width: 1px;
-                                border-color: #3a3a3c;
+                            // Rectangle {
+                            //     // 状态指示
+                            //     height: 32px;
+                            //     border-radius: 8px;
+                            //     background: #2c2c2e;
+                            //     border-width: 1px;
+                            //     border-color: #3a3a3c;
 
-                                Text {
-                                    text: root.sync_status == "" ? "未连接" : root.sync_status;
-                                    color: #6e6e73;
-                                    font-size: 12px;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                    width: 100%;
-                                }
-                            }
+                            //     Text {
+                            //         text: root.sync_status == "" ? "未连接" : root.sync_status;
+                            //         color: #6e6e73;
+                            //         font-size: 12px;
+                            //         horizontal-alignment: center;
+                            //         vertical-alignment: center;
+                            //         width: 100%;
+                            //     }
+                            // }
                         }
                     }
                 }
@@ -1356,6 +1369,37 @@ export component SettingsWindow inherits Window {
                     vertical-alignment: center;
                 }
             }
+        }
+    }
+
+    // Toast 浮层：固定在窗口底部居中，显示 2 秒后自动隐藏
+    // z-index 最高的浮层，覆盖所有内容
+    if root.toast_visible : Rectangle {
+        // 背景半透明遮罩，点击不穿透但也不阻断（仅视觉聚焦 toast）
+        x: (parent.width - self.width) / 2;
+        y: parent.height - self.height - 40px;
+        width: min(parent.width - 40px, 360px);
+        height: 44px;
+        border-radius: 10px;
+        // 根据 toast_kind 切换颜色：success 绿、error 红、info 灰
+        background: root.toast_kind == "success" ? #1a4d2e
+            : root.toast_kind == "error" ? #4d1a1a
+            : #2c2c2e;
+        border-width: 1px;
+        border-color: root.toast_kind == "success" ? #34c759
+            : root.toast_kind == "error" ? #ff453a
+            : #48484a;
+
+        Text {
+            x: 16px;
+            width: parent.width - 32px;
+            height: 100%;
+            text: root.toast_message;
+            color: #f5f5f7;
+            font-size: 13px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
         }
     }
 

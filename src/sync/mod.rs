@@ -13,7 +13,7 @@ pub mod webdav;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::clipboard_item::ClipboardItem;
+use crate::clipboard_item::{ClipboardItem, ClipboardKind};
 use crate::common::now_millis;
 use crate::storage::Storage;
 use crate::sync::config::SyncConfig;
@@ -52,12 +52,13 @@ const BACKOFF_SECS: i64 = 120;
 impl SyncCoordinator {
     /// 构造协调器：配置必须可用（调用方先判断 is_usable）
     pub fn new(config: SyncConfig) -> Self {
-        let device_name = config.device_name.clone();
         let client = WebdavClient::new(&config.url, &config.username, &config.password);
         Self {
             config,
             client,
-            device_name,
+            // device_name 仅作事件元数据（source_device），固定值，用户无需配置
+            // 防回环已由 apply_events 的 LWW 策略处理，不依赖 device_name
+            device_name: "ccopy".to_string(),
             etag_cache: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(Vec::new())),
             dir_created: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -90,10 +91,22 @@ impl SyncCoordinator {
     }
 
     /// 推送 upsert 事件：生成全量快照入队
-    /// marked_only 开启时，无备注的记录不入队（避免垃圾数据同步）
+    /// 过滤规则（两个开关正交，语义清晰）：
+    /// - 图片类：仅受 image_enabled 控制，与 marked_only 无关
+    ///   （图片本身就是显性内容，不应被「仅标记」挡住）
+    /// - 文本/HTML/RTF 等非图片类：marked_only 开启时需有备注才同步
     pub fn push_upsert(&self, item: &ClipboardItem) {
-        if self.config.marked_only && item.note.is_none() {
-            return;
+        let is_image = matches!(item.kind, ClipboardKind::Image);
+        if is_image {
+            // 图片：只看 image_enabled
+            if !self.config.image_enabled {
+                return;
+            }
+        } else {
+            // 非图片：marked_only 开启时需有备注
+            if self.config.marked_only && item.note.is_none() {
+                return;
+            }
         }
         let event = SyncEvent::from_item(item, &self.device_name);
         if let Ok(mut q) = self.pending.lock() {
@@ -107,6 +120,76 @@ impl SyncCoordinator {
         if let Ok(mut q) = self.pending.lock() {
             q.push(event);
         }
+    }
+
+    /// 准备全量推送：返回符合过滤规则的本地记录（主线程调用，不碰网络）
+    /// 用于「立即同步」时把本地已有数据一次性推上去
+    pub fn collect_push_all(&self, storage: &Storage) -> Vec<ClipboardItem> {
+        let items = match storage.list_all_items(false) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        items
+            .into_iter()
+            .filter(|item| {
+                let is_image = matches!(item.kind, ClipboardKind::Image);
+                if is_image {
+                    self.config.image_enabled
+                } else {
+                    !self.config.marked_only || item.note.is_some()
+                }
+            })
+            .collect()
+    }
+
+    /// 后台执行全量推送：对已收集的 items 做去重（远端已有则跳过）后入队并 flush
+    /// 返回实际推送的条数
+    pub fn flush_push_all(&self, items: Vec<ClipboardItem>) -> Result<usize, String> {
+        if self.in_backoff() {
+            return Ok(0);
+        }
+        // 列出远端已有的事件 hash 集合（失败则当作空集，全量推）
+        let remote_hashes: std::collections::HashSet<String> = self
+            .list_remote_event_hashes()
+            .unwrap_or_default();
+        let mut to_push = Vec::new();
+        for item in &items {
+            if remote_hashes.contains(&item.hash) {
+                continue;
+            }
+            let event = SyncEvent::from_item(item, &self.device_name);
+            to_push.push(event);
+        }
+        if to_push.is_empty() {
+            return Ok(0);
+        }
+        match self.do_flush_push(&to_push) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                self.maybe_backoff(&e);
+                Err(e)
+            }
+        }
+    }
+
+    /// 列出远端 events 目录下所有事件文件的 hash 集合
+    /// 文件名形如 <hash>.json，提取 hash 部分
+    fn list_remote_event_hashes(&self) -> Result<std::collections::HashSet<String>, String> {
+        self.ensure_dir_cached(EVENTS_DIR)?;
+        let files = self.client.list(EVENTS_DIR)?;
+        let mut hashes = std::collections::HashSet::new();
+        for f in &files {
+            if f.is_dir {
+                continue;
+            }
+            // href 形如 /dav/CCopy/sync/events/abc123.json，取最后一段文件名去 .json 后缀
+            if let Some(name) = f.href.rsplit('/').next() {
+                if let Some(hash) = name.strip_suffix(".json") {
+                    hashes.insert(hash.to_string());
+                }
+            }
+        }
+        Ok(hashes)
     }
 
     /// 确保目录存在（带缓存）：已创建过的目录不重复 MKCOL
@@ -124,41 +207,44 @@ impl SyncCoordinator {
         Ok(())
     }
 
-    /// 执行一次推送：把待推送事件追加到 WebDAV 本月 jsonl
+    /// 执行一次推送：把待推送事件逐条 PUT 到 WebDAV
     /// 在后台线程调用。限流退避期间跳过，事件保留在队列里下次重试
-    pub fn flush_push(&self) -> Result<(), String> {
+    /// 返回成功推送的条数
+    pub fn flush_push(&self) -> Result<usize, String> {
         if self.in_backoff() {
-            return Ok(()); // 退避中，事件留在队列
+            return Ok(0); // 退避中，事件留在队列
         }
         let events: Vec<SyncEvent> = {
             let mut q = self.pending.lock().map_err(|e| format!("锁失败: {e}"))?;
             std::mem::take(&mut *q)
         };
         if events.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
-        // 执行推送，失败时把事件放回队列并触发退避
-        if let Err(e) = self.do_flush_push(&events) {
-            self.maybe_backoff(&e);
-            // 事件放回队列尾部，下次重试
-            if let Ok(mut q) = self.pending.lock() {
-                q.extend(events);
+        // 执行推送，失败时把未推事件放回队列并触发退避
+        match self.do_flush_push(&events) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                self.maybe_backoff(&e);
+                // 事件放回队列尾部，下次重试
+                if let Ok(mut q) = self.pending.lock() {
+                    q.extend(events);
+                }
+                Err(e)
             }
-            return Err(e);
         }
-        Ok(())
     }
 
     /// 实际推送逻辑：每条事件单独 PUT 一个文件
     /// upsert -> events/<hash>.json，delete -> tombstones/<hash>.json
     /// 同 hash 覆盖式更新，文件不堆积，流量=单条大小
-    fn do_flush_push(&self, events: &[SyncEvent]) -> Result<(), String> {
+    /// 图片项：入队阶段已按 image_enabled 过滤，能进队列的图片都需上传图片文件
+    /// 返回成功推送的条数（部分失败时返回已成功数，遇错中止后续）
+    fn do_flush_push(&self, events: &[SyncEvent]) -> Result<usize, String> {
+        let mut pushed = 0usize;
         for ev in events {
-            let ev_to_write = if self.config.image_enabled {
-                self.maybe_upload_image(ev)?
-            } else {
-                ev.clone()
-            };
+            // 图片项上传图片文件（非图片原样返回）
+            let ev_to_write = self.maybe_upload_image(ev)?;
             let json = ev_to_write.to_jsonl()?;
             match &ev_to_write {
                 SyncEvent::Upsert(item) => {
@@ -172,16 +258,23 @@ impl SyncCoordinator {
                     self.client.put(&rel, json.into_bytes())?;
                 }
             }
+            pushed += 1;
         }
-        Ok(())
+        Ok(pushed)
     }
 
     /// 图片项上传：把本地 blob 文件上传到 images/<hash>.png，返回改写 blob_path 后的事件
-    /// 非图片项或上传失败时原样返回
+    /// 非图片项原样返回；image_enabled 关闭时图片元数据照传但不传图片文件
     fn maybe_upload_image(&self, ev: &SyncEvent) -> Result<SyncEvent, String> {
         let SyncEvent::Upsert(item) = ev else { return Ok(ev.clone()) };
         if item.kind != "image" {
             return Ok(ev.clone());
+        }
+        // image_enabled 关闭：图片元数据照传（不带 blob_path），不传图片文件
+        if !self.config.image_enabled {
+            let mut new_item = item.clone();
+            new_item.blob_path = None;
+            return Ok(SyncEvent::Upsert(new_item));
         }
         let local_blob = match &item.blob_path {
             Some(p) if !p.is_empty() => p.clone(),
@@ -271,28 +364,34 @@ impl SyncCoordinator {
             // 解析：每个文件一条事件
             let text = String::from_utf8_lossy(&data);
             if let Ok(ev) = SyncEvent::from_jsonl(text.trim()) {
-                // 防回环：跳过本机产生的事件
-                let is_self = match &ev {
-                    SyncEvent::Upsert(i) => i.source_device == self.device_name,
-                    SyncEvent::Delete(d) => d.source_device == self.device_name,
-                };
-                if !is_self {
-                    events.push(ev);
-                }
+                // 防回环由 apply_events 的 LWW 策略处理：
+                // 本机产生的事件拉回时本地 updated_at 相同，会被跳过
+                events.push(ev);
             }
         }
         Ok(events)
     }
 
     /// 把合并后的事件应用到本地存储（在主线程调用）
+    /// LWW 策略：本地已有该 hash 且本地 updated_at >= 远端 updated_at 时跳过（不覆盖较新数据）
+    /// 这同时实现了防回环：本机产生的事件拉回时本地 updated_at 相同，跳过
     /// 图片项：blob_path 为 images/<hash>.png 时下载图片到本地 blobs 并改写为本地路径
     /// 图片下载失败则跳过该记录（避免存入无效路径）
     pub fn apply_events(&self, storage: &Storage, events: Vec<SyncEvent>) -> PullStats {
         let mut applied = 0usize;
         let mut deleted = 0usize;
+        let mut skipped = 0usize;
         for ev in events {
             match ev {
                 SyncEvent::Upsert(mut item) => {
+                    // LWW：本地已有且本地 updated_at >= 远端 updated_at 则跳过
+                    // item.id 即内容 hash（同步用 hash 作 ID）
+                    if let Ok(Some(local)) = storage.find_by_hash(&item.id) {
+                        if local.updated_at >= item.updated_at {
+                            skipped += 1;
+                            continue;
+                        }
+                    }
                     // 图片同步路径处理：下载图片到本地 blobs
                     if item.kind == "image" {
                         if let Some(ref blob) = item.blob_path {
@@ -312,7 +411,12 @@ impl SyncCoordinator {
                     }
                 }
                 SyncEvent::Delete(d) => {
+                    // LWW：本地已有且本地 updated_at > 删除时间戳则跳过（删除后又更新了）
                     if let Ok(Some(local)) = storage.find_by_hash(&d.id) {
+                        if local.updated_at > d.updated_at {
+                            skipped += 1;
+                            continue;
+                        }
                         if let Some(id) = local.id {
                             let _ = storage.delete_item(id);
                             deleted += 1;
@@ -323,7 +427,7 @@ impl SyncCoordinator {
         }
         PullStats {
             downloaded: 0,
-            skipped: 0,
+            skipped,
             applied,
             deleted,
         }
@@ -438,8 +542,8 @@ pub fn build_coordinator(config: SyncConfig) -> Option<SharedCoordinator> {
     Some(Arc::new(Mutex::new(SyncCoordinator::new(config))))
 }
 
-/// 后台执行单次推送：事件已通过 push_upsert/push_delete 入队
-pub fn spawn_flush(coordinator: SharedCoordinator) {
+/// 后台执行单次推送（无需回调）
+pub fn spawn_flush_silent(coordinator: SharedCoordinator) {
     std::thread::spawn(move || {
         if let Ok(c) = coordinator.lock() {
             let _ = c.flush_push();

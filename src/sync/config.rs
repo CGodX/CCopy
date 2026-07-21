@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::settings::{
-    load_sync_device_name, load_sync_enabled, load_sync_image_enabled, load_sync_marked_only,
-    load_sync_password, load_sync_retain_months_value, load_sync_url, load_sync_username,
+    load_sync_enabled, load_sync_image_enabled, load_sync_marked_only, load_sync_password,
+    load_sync_retain_months_value, load_sync_url, load_sync_username,
 };
 use crate::storage::Storage;
 
@@ -17,7 +17,6 @@ pub struct SyncConfig {
     pub url: String,
     pub username: String,
     pub password: String,
-    pub device_name: String,
     pub image_enabled: bool,
     pub marked_only: bool,
     pub retain_months: usize,
@@ -31,7 +30,6 @@ impl SyncConfig {
             url: load_sync_url(storage),
             username: load_sync_username(storage),
             password: load_sync_password(storage),
-            device_name: load_sync_device_name(storage),
             image_enabled: load_sync_image_enabled(storage),
             marked_only: load_sync_marked_only(storage),
             retain_months: load_sync_retain_months_value(storage),
@@ -43,6 +41,5 @@ impl SyncConfig {
         self.enabled
             && !self.url.trim().is_empty()
             && !self.username.trim().is_empty()
-            && !self.device_name.trim().is_empty()
     }
 }

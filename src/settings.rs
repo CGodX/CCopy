@@ -12,9 +12,9 @@ use crate::sync::{self, SharedCoordinator};
 use crate::ui::SettingsWindow;
 use crate::updater::{CheckResult, UpdateInfo};
 use crate::{
-    SETTING_HOTKEY, SETTING_MAX_AGE_DAYS, SETTING_MAX_HISTORY, SETTING_SYNC_DEVICE_NAME,
-    SETTING_SYNC_ENABLED, SETTING_SYNC_IMAGE_ENABLED, SETTING_SYNC_MARKED_ONLY,
-    SETTING_SYNC_PASSWORD, SETTING_SYNC_RETAIN_MONTHS, SETTING_SYNC_URL, SETTING_SYNC_USERNAME,
+    SETTING_HOTKEY, SETTING_MAX_AGE_DAYS, SETTING_MAX_HISTORY, SETTING_SYNC_ENABLED,
+    SETTING_SYNC_IMAGE_ENABLED, SETTING_SYNC_MARKED_ONLY, SETTING_SYNC_PASSWORD,
+    SETTING_SYNC_RETAIN_MONTHS, SETTING_SYNC_URL, SETTING_SYNC_USERNAME,
 };
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -66,7 +66,6 @@ pub fn open(
     window.set_sync_url(SharedString::from(load_sync_url(&storage)));
     window.set_sync_username(SharedString::from(load_sync_username(&storage)));
     window.set_sync_password(SharedString::from(load_sync_password(&storage)));
-    window.set_sync_device_name(SharedString::from(load_sync_device_name(&storage)));
     window.set_sync_image_enabled(load_sync_image_enabled(&storage));
     window.set_sync_marked_only(load_sync_marked_only(&storage));
     window.set_sync_retain_months(SharedString::from(load_sync_retain_months_display(&storage)));
@@ -244,7 +243,6 @@ pub fn open(
         let _ = s.set_setting(SETTING_SYNC_URL, w.get_sync_url().as_str());
         let _ = s.set_setting(SETTING_SYNC_USERNAME, w.get_sync_username().as_str());
         let _ = s.set_setting(SETTING_SYNC_PASSWORD, w.get_sync_password().as_str());
-        let _ = s.set_setting(SETTING_SYNC_DEVICE_NAME, w.get_sync_device_name().as_str());
         let _ = s.set_setting(
             SETTING_SYNC_IMAGE_ENABLED,
             if w.get_sync_image_enabled() { "1" } else { "0" },
@@ -265,14 +263,62 @@ pub fn open(
         // 重建协调器：配置变更后用新配置重新构建
         let new_coord = sync::build_coordinator(sync::config::SyncConfig::load(&storage_sync));
         *sync_coord_for_apply.borrow_mut() = new_coord;
-        // 状态反馈
+        // 状态反馈改用 toast
         if let Some(w) = window_weak.upgrade() {
             if w.get_sync_enabled() {
-                w.set_sync_status(SharedString::from("配置已保存"));
+                show_toast(&w, "配置已保存", "success");
             } else {
-                w.set_sync_status(SharedString::from("同步未启用"));
+                show_toast(&w, "同步已关闭", "info");
             }
         }
+    });
+
+    // 测试连接：用当前界面输入的配置（先应用）临时构建协调器，调用 ping 验证
+    let storage_for_test = storage.clone();
+    let window_weak = window.as_weak();
+    window.on_test_connection(move || {
+        let Some(w) = window_weak.upgrade() else { return };
+        // 先把当前界面配置落盘（保证用最新配置测试）
+        {
+            let s = storage_for_test.borrow();
+            let _ = s.set_setting(
+                SETTING_SYNC_ENABLED,
+                if w.get_sync_enabled() { "1" } else { "0" },
+            );
+            let _ = s.set_setting(SETTING_SYNC_URL, w.get_sync_url().as_str());
+            let _ = s.set_setting(SETTING_SYNC_USERNAME, w.get_sync_username().as_str());
+            let _ = s.set_setting(SETTING_SYNC_PASSWORD, w.get_sync_password().as_str());
+        }
+        // 检查必填项
+        let url = w.get_sync_url().to_string();
+        let username = w.get_sync_username().to_string();
+        if url.trim().is_empty() || username.trim().is_empty() {
+            show_toast(&w, "请填写 WebDAV 地址和用户名", "error");
+            return;
+        }
+        show_toast(&w, "测试中…", "info");
+        // 临时构建协调器测试（不替换全局协调器）
+        let config = sync::config::SyncConfig::load(&storage_for_test);
+        let window_weak_for_thread = window_weak.clone();
+        std::thread::spawn(move || {
+            let result = if config.is_usable() {
+                let coord = sync::SyncCoordinator::new(config);
+                coord.ping().map(|_| ()).map_err(|e| e)
+            } else {
+                Err("配置不完整或同步未启用".to_string())
+            };
+            // 回主线程显示结果
+            let msg = match result {
+                Ok(_) => ("连接成功".to_string(), "success"),
+                Err(e) => (format!("连接失败: {e}"), "error"),
+            };
+            slint::invoke_from_event_loop(move || {
+                if let Some(w) = window_weak_for_thread.upgrade() {
+                    show_toast(&w, &msg.0, msg.1);
+                }
+            })
+            .ok();
+        });
     });
 
     // 立即同步：触发一次推送+拉取，结果通过 Arc 缓冲由短期 Timer 回主线程应用
@@ -284,24 +330,40 @@ pub fn open(
             Some(c) => c.clone(),
             None => {
                 if let Some(w) = window_weak.upgrade() {
-                    w.set_sync_status(SharedString::from("同步未启用"));
+                    show_toast(&w, "同步未启用", "error");
                 }
                 return;
             }
         };
+        // 主线程收集本地待推送记录（不碰网络，不阻塞 UI）
+        let items_to_push = {
+            let storage = storage_for_now.borrow();
+            let c = coord.lock().unwrap();
+            c.collect_push_all(&storage)
+        };
         if let Some(w) = window_weak.upgrade() {
-            w.set_sync_status(SharedString::from("同步中…"));
+            show_toast(&w, &format!("同步中…（本地 {} 条待推送）", items_to_push.len()), "info");
         }
-        // 先推送待发事件
-        sync::spawn_flush(coord.clone());
-        // 后台拉取，结果写入 Arc 缓冲
-        let buf: Arc<Mutex<Option<Result<Vec<sync::event::SyncEvent>, String>>>> =
+        // 推送结果缓冲：后台线程写入，主线程轮询消费
+        let push_buf: Arc<Mutex<Option<Result<usize, String>>>> = Arc::new(Mutex::new(None));
+        let pull_buf: Arc<Mutex<Option<Result<Vec<sync::event::SyncEvent>, String>>>> =
             Arc::new(Mutex::new(None));
-        let buf_for_thread = buf.clone();
-        sync::spawn_pull(coord.clone(), move |result| {
-            *buf_for_thread.lock().unwrap() = Some(result);
+        // 后台全量推送：去重 + flush
+        let push_buf_for_thread = push_buf.clone();
+        let coord_for_flush = coord.clone();
+        std::thread::spawn(move || {
+            let result = match coord_for_flush.lock() {
+                Ok(c) => c.flush_push_all(items_to_push),
+                Err(e) => Err(format!("协调器锁失败: {e}")),
+            };
+            *push_buf_for_thread.lock().unwrap() = Some(result);
         });
-        // 短期 Timer：主线程轮询缓冲，拿到结果后 apply + 更新 UI + 自停
+        // 后台拉取，结果写入 Arc 缓冲
+        let pull_buf_for_thread = pull_buf.clone();
+        sync::spawn_pull(coord.clone(), move |result| {
+            *pull_buf_for_thread.lock().unwrap() = Some(result);
+        });
+        // 短期 Timer：主线程轮询两个缓冲，都完成后合并显示 + 自停
         let storage_for_check = storage_for_now.clone();
         let coord_for_check = coord;
         let window_weak_for_check = window_weak.clone();
@@ -311,15 +373,42 @@ pub fn open(
             slint::TimerMode::Repeated,
             std::time::Duration::from_millis(500),
             move || {
-                let taken = buf.lock().unwrap().take();
-                let Some(result) = taken else { return };
-                // 拿到结果，停止轮询
+                // 两个结果都到了才处理（先检查不取，避免单边 take 导致丢失）
+                let (push_ready, pull_ready) = {
+                    let pb = push_buf.lock().unwrap();
+                    let pl = pull_buf.lock().unwrap();
+                    (pb.is_some(), pl.is_some())
+                };
+                if !(push_ready && pull_ready) {
+                    return;
+                }
+                // 两个都就绪，同时取走
+                let push_res = push_buf.lock().unwrap().take().unwrap();
+                let pull_res = pull_buf.lock().unwrap().take().unwrap();
                 let win = window_weak_for_check.upgrade();
-                match result {
+                // 推送结果
+                let pushed_str = match push_res {
+                    Ok(n) => format!("推送 {}", n),
                     Err(e) => {
                         if let Some(w) = &win {
-                            w.set_sync_status(SharedString::from(format!("同步失败: {e}")));
+                            show_toast(w, &format!("推送失败: {e}"), "error");
                         }
+                        check_timer_for_closure.stop();
+                        return;
+                    }
+                };
+                // 拉取结果
+                let pull_str = match pull_res {
+                    Err(e) => {
+                        if let Some(w) = &win {
+                            show_toast(
+                                w,
+                                &format!("{}，拉取失败: {}", pushed_str, e),
+                                "error",
+                            );
+                        }
+                        check_timer_for_closure.stop();
+                        return;
                     }
                     Ok(events) => {
                         let count = events.len();
@@ -328,13 +417,14 @@ pub fn open(
                             let c = coord_for_check.lock().unwrap();
                             c.apply_events(&storage, events)
                         };
-                        if let Some(w) = &win {
-                            w.set_sync_status(SharedString::from(format!(
-                                "已同步（拉取 {}，应用 {}，删除 {}）",
-                                count, applied.applied, applied.deleted
-                            )));
-                        }
+                        format!(
+                            "{}，拉取 {}（应用 {}，删除 {}）",
+                            pushed_str, count, applied.applied, applied.deleted
+                        )
                     }
+                };
+                if let Some(w) = &win {
+                    show_toast(w, &pull_str, "success");
                 }
                 check_timer_for_closure.stop();
             },
@@ -587,23 +677,6 @@ pub fn load_sync_password(storage: &Rc<RefCell<Storage>>) -> String {
         .unwrap_or_default()
 }
 
-/// 设备名：未设置时取主机名并存回（保证后续读取稳定）
-pub fn load_sync_device_name(storage: &Rc<RefCell<Storage>>) -> String {
-    if let Some(name) = storage
-        .borrow()
-        .get_setting(SETTING_SYNC_DEVICE_NAME)
-        .ok()
-        .flatten()
-    {
-        return name;
-    }
-    let name = default_device_name();
-    let _ = storage
-        .borrow()
-        .set_setting(SETTING_SYNC_DEVICE_NAME, &name);
-    name
-}
-
 pub fn load_sync_image_enabled(storage: &Rc<RefCell<Storage>>) -> bool {
     storage
         .borrow()
@@ -660,28 +733,28 @@ fn normalize_key(text: &str) -> String {
     }
 }
 
-/// 默认设备名：取主机名，失败时回退 "ccopy-pc"
-fn default_device_name() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        use std::ffi::OsString;
-        use std::os::windows::ffi::OsStringExt;
-        extern "system" {
-            fn GetComputerNameW(lpBuffer: *mut u16, nSize: *mut u32) -> i32;
-        }
-        unsafe {
-            let mut size: u32 = 0;
-            // 第一次调用获取所需长度
-            GetComputerNameW(std::ptr::null_mut(), &mut size as *mut u32);
-            let mut buf = vec![0u16; size as usize];
-            if GetComputerNameW(buf.as_mut_ptr(), &mut size as *mut u32) != 0 {
-                let os = OsString::from_wide(&buf[..size as usize]);
-                return os.to_string_lossy().into_owned();
+/// 显示 toast 通知：设置消息和类型并显示，2 秒后自动隐藏
+/// kind: "info" | "success" | "error"
+fn show_toast(window: &SettingsWindow, message: &str, kind: &str) {
+    window.set_toast_message(SharedString::from(message));
+    window.set_toast_kind(SharedString::from(kind));
+    window.set_toast_visible(true);
+    // 2 秒后自动隐藏：用一次性 Timer
+    let window_weak = window.as_weak();
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::SingleShot,
+        std::time::Duration::from_millis(2000),
+        move || {
+            if let Some(w) = window_weak.upgrade() {
+                w.set_toast_visible(false);
             }
-        }
-    }
-    "ccopy-pc".to_string()
+        },
+    );
+    // Timer 必须 forget 保持存活，否则离开作用域即销毁
+    std::mem::forget(timer);
 }
+
 
 
 

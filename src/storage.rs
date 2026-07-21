@@ -342,6 +342,26 @@ impl Storage {
         Ok(items.into_iter().next())
     }
 
+    /// 列出所有记录（用于全量推送同步）
+    /// marked_only 为 true 时只返回有备注的记录
+    pub fn list_all_items(&self, marked_only: bool) -> rusqlite::Result<Vec<ClipboardItem>> {
+        let sql = if marked_only {
+            "SELECT id, kind, preview, text_content, plain_text, blob_path, format_name, mime_type,
+                    width, height, size_bytes, hash, note, created_at, updated_at, last_used_at
+             FROM clipboard_items
+             WHERE note IS NOT NULL AND note != ''"
+        } else {
+            "SELECT id, kind, preview, text_content, plain_text, blob_path, format_name, mime_type,
+                    width, height, size_bytes, hash, note, created_at, updated_at, last_used_at
+             FROM clipboard_items"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        let mut items = Vec::new();
+        self.collect_items(&mut rows, &mut items)?;
+        Ok(items)
+    }
+
     /// 从已 prepare 的 rows 收集 ClipboardItem（含 files），复用给多个查询方法
     fn collect_items(
         &self,

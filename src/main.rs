@@ -49,7 +49,6 @@ pub const SETTING_SYNC_ENABLED: &str = "sync_enabled";
 pub const SETTING_SYNC_URL: &str = "sync_url";
 pub const SETTING_SYNC_USERNAME: &str = "sync_username";
 pub const SETTING_SYNC_PASSWORD: &str = "sync_password";
-pub const SETTING_SYNC_DEVICE_NAME: &str = "sync_device_name";
 pub const SETTING_SYNC_IMAGE_ENABLED: &str = "sync_image_enabled";
 pub const SETTING_SYNC_MARKED_ONLY: &str = "sync_marked_only";
 pub const SETTING_SYNC_RETAIN_MONTHS: &str = "sync_retain_months";
@@ -855,7 +854,7 @@ app.on_search_changed(move |query| {
                     Some(c) => c.clone(),
                     None => return,
                 };
-                sync::spawn_flush(coord);
+                sync::spawn_flush_silent(coord);
             },
         );
         std::mem::forget(push_timer);
