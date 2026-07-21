@@ -49,6 +49,7 @@ export component SettingsWindow inherits Window {
     in-out property <string> sync_password;
     in-out property <string> sync_device_name;
     in-out property <bool> sync_image_enabled;
+    in-out property <bool> sync_marked_only;
     in-out property <string> sync_retain_months;
     in-out property <string> sync_status;
     // 密码是否明文显示
@@ -1062,6 +1063,48 @@ export component SettingsWindow inherits Window {
                                         text <=> root.sync_device_name;
                                         color: #f5f5f7;
                                         font-size: 14px;
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                // 仅同步标记内容开关（默认开启，大幅减少流量）
+                                height: 32px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: "仅同步标记内容";
+                                    color: #aeaeb2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    vertical-alignment: center;
+                                }
+
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                }
+
+                                Rectangle {
+                                    width: 48px;
+                                    height: 28px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 14px;
+                                    background: root.sync_marked_only ? #34c759 : #3a3a3c;
+
+                                    sync_marked_toggle := TouchArea {
+                                        clicked => {
+                                            root.sync_marked_only = !root.sync_marked_only;
+                                            root.apply_sync_config();
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        x: root.sync_marked_only ? (parent.width - self.width - 3px) : 3px;
+                                        y: 3px;
+                                        width: 22px;
+                                        height: 22px;
+                                        border-radius: 11px;
+                                        background: #ffffff;
                                     }
                                 }
                             }

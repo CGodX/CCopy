@@ -51,6 +51,7 @@ pub const SETTING_SYNC_USERNAME: &str = "sync_username";
 pub const SETTING_SYNC_PASSWORD: &str = "sync_password";
 pub const SETTING_SYNC_DEVICE_NAME: &str = "sync_device_name";
 pub const SETTING_SYNC_IMAGE_ENABLED: &str = "sync_image_enabled";
+pub const SETTING_SYNC_MARKED_ONLY: &str = "sync_marked_only";
 pub const SETTING_SYNC_RETAIN_MONTHS: &str = "sync_retain_months";
 
 /// 单实例检测：通过命名互斥体保证程序只能运行一个实例

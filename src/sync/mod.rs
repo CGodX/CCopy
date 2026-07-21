@@ -24,8 +24,10 @@ use crate::sync::webdav::WebdavClient;
 /// WebDAV 上的同步根目录（相对 base_url）
 #[allow(dead_code)]
 const SYNC_ROOT: &str = "CCopy/sync";
-/// 设备事件文件目录
-const DEVICES_DIR: &str = "CCopy/sync/devices";
+/// upsert 事件目录：每条事件一个文件 events/<hash>.json，同 hash 覆盖
+const EVENTS_DIR: &str = "CCopy/sync/events";
+/// 删除标记目录：tombstones/<hash>.json，同 hash 覆盖
+const TOMBSTONES_DIR: &str = "CCopy/sync/tombstones";
 
 /// 协调器：持有配置与本地状态，提供推送/拉取接口
 pub struct SyncCoordinator {
@@ -87,8 +89,12 @@ impl SyncCoordinator {
         self.client.ping()
     }
 
-    /// 推送 upsert 事件：读出完整 item 生成全量快照，追加到本月 jsonl
+    /// 推送 upsert 事件：生成全量快照入队
+    /// marked_only 开启时，无备注的记录不入队（避免垃圾数据同步）
     pub fn push_upsert(&self, item: &ClipboardItem) {
+        if self.config.marked_only && item.note.is_none() {
+            return;
+        }
         let event = SyncEvent::from_item(item, &self.device_name);
         if let Ok(mut q) = self.pending.lock() {
             q.push(event);
@@ -143,30 +149,31 @@ impl SyncCoordinator {
         Ok(())
     }
 
-    /// 实际推送逻辑：确保目录、读旧内容、追加、PUT
+    /// 实际推送逻辑：每条事件单独 PUT 一个文件
+    /// upsert -> events/<hash>.json，delete -> tombstones/<hash>.json
+    /// 同 hash 覆盖式更新，文件不堆积，流量=单条大小
     fn do_flush_push(&self, events: &[SyncEvent]) -> Result<(), String> {
-        let device_dir = format!("{DEVICES_DIR}/{}", self.device_name);
-        self.ensure_dir_cached(&device_dir)?;
-        // 读取本月文件已有内容
-        let month = current_month();
-        let rel = format!("{device_dir}/{month}.jsonl");
-        let mut content = match self.client.get(&rel) {
-            Ok(data) => String::from_utf8_lossy(&data).to_string(),
-            Err(_) => String::new(), // 文件不存在
-        };
-        // 追加新事件（图片项需先上传图片）
         for ev in events {
             let ev_to_write = if self.config.image_enabled {
                 self.maybe_upload_image(ev)?
             } else {
                 ev.clone()
             };
-            if let Ok(line) = ev_to_write.to_jsonl() {
-                content.push_str(&line);
-                content.push('\n');
+            let json = ev_to_write.to_jsonl()?;
+            match &ev_to_write {
+                SyncEvent::Upsert(item) => {
+                    self.ensure_dir_cached(EVENTS_DIR)?;
+                    let rel = format!("{EVENTS_DIR}/{}.json", item.id);
+                    self.client.put(&rel, json.into_bytes())?;
+                }
+                SyncEvent::Delete(d) => {
+                    self.ensure_dir_cached(TOMBSTONES_DIR)?;
+                    let rel = format!("{TOMBSTONES_DIR}/{}.json", d.id);
+                    self.client.put(&rel, json.into_bytes())?;
+                }
             }
         }
-        self.client.put(&rel, content.into_bytes())
+        Ok(())
     }
 
     /// 图片项上传：把本地 blob 文件上传到 images/<hash>.png，返回改写 blob_path 后的事件
@@ -217,67 +224,64 @@ impl SyncCoordinator {
         }
     }
 
-    /// 实际拉取逻辑
+    /// 实际拉取逻辑：列 events/ 和 tombstones/ 两个扁平目录，etag 增量下载
     fn do_pull_collect(&self) -> Result<Vec<SyncEvent>, String> {
-        // 确保 devices 目录存在（带缓存）
-        self.ensure_dir_cached(DEVICES_DIR)?;
-        // 列 devices 目录，获取各设备子目录
-        let device_dirs = self.client.list(DEVICES_DIR)?;
         let mut all_events: Vec<SyncEvent> = Vec::new();
+        // 拉取 upsert 事件
+        all_events.extend(self.pull_dir(EVENTS_DIR)?);
+        // 拉取删除标记
+        all_events.extend(self.pull_dir(TOMBSTONES_DIR)?);
+        // 合并：按 id 取最新（delete 时间戳更大则胜出）
+        let merged = merge_events(all_events);
+        Ok(merged.into_iter().map(|m| m.event).collect())
+    }
 
-        for d in &device_dirs {
-            if !d.is_dir {
+    /// 拉取单个目录下所有事件文件：etag 缓存增量下载，防回环跳过本机事件
+    fn pull_dir(&self, dir: &str) -> Result<Vec<SyncEvent>, String> {
+        self.ensure_dir_cached(dir)?;
+        let files = match self.client.list(dir) {
+            Ok(v) => v,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut events = Vec::new();
+        for f in &files {
+            if f.is_dir {
                 continue;
             }
-            // 列该设备目录下的月份文件
-            let sub_files = match self.client.list(&d.href) {
-                Ok(v) => v,
-                Err(_) => continue,
+            // etag 缓存：未变化则跳过
+            let cache_key = f.href.clone();
+            let cached = {
+                let cache = self.etag_cache.lock().map_err(|e| format!("锁失败: {e}"))?;
+                cache.get(&cache_key).cloned()
             };
-            for f in sub_files {
-                if f.is_dir {
+            if let Some(et) = &cached {
+                if !et.is_empty() && et == &f.etag {
                     continue;
                 }
-                // etag 缓存：未变化则跳过
-                let cache_key = f.href.clone();
-                let cached = {
-                    let cache = self.etag_cache.lock().map_err(|e| format!("锁失败: {e}"))?;
-                    cache.get(&cache_key).cloned()
+            }
+            // 下载文件内容（单条事件）
+            let data = match self.client.get(&f.href) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            // 更新 etag 缓存
+            if let Ok(mut cache) = self.etag_cache.lock() {
+                cache.insert(cache_key, f.etag.clone());
+            }
+            // 解析：每个文件一条事件
+            let text = String::from_utf8_lossy(&data);
+            if let Ok(ev) = SyncEvent::from_jsonl(text.trim()) {
+                // 防回环：跳过本机产生的事件
+                let is_self = match &ev {
+                    SyncEvent::Upsert(i) => i.source_device == self.device_name,
+                    SyncEvent::Delete(d) => d.source_device == self.device_name,
                 };
-                if let Some(et) = &cached {
-                    if !et.is_empty() && et == &f.etag {
-                        continue;
-                    }
-                }
-                // 下载文件内容
-                let data = match self.client.get(&f.href) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
-                // 更新 etag 缓存
-                if let Ok(mut cache) = self.etag_cache.lock() {
-                    cache.insert(cache_key, f.etag.clone());
-                }
-                // 解析每行事件
-                let text = String::from_utf8_lossy(&data);
-                for line in text.lines() {
-                    if let Ok(ev) = SyncEvent::from_jsonl(line) {
-                        // 防回环：跳过本机产生的事件
-                        let is_self = match &ev {
-                            SyncEvent::Upsert(i) => i.source_device == self.device_name,
-                            SyncEvent::Delete(d) => d.source_device == self.device_name,
-                        };
-                        if !is_self {
-                            all_events.push(ev);
-                        }
-                    }
+                if !is_self {
+                    events.push(ev);
                 }
             }
         }
-
-        // 合并：按 id 取最新
-        let merged = merge_events(all_events);
-        Ok(merged.into_iter().map(|m| m.event).collect())
+        Ok(events)
     }
 
     /// 把合并后的事件应用到本地存储（在主线程调用）
@@ -344,28 +348,26 @@ impl SyncCoordinator {
         Ok(local_blob)
     }
 
-    /// 清理过期归档：删除超过保留期的设备月份文件
+    /// 清理过期归档：删除超过保留期的 events 和 tombstones 文件
+    /// 按 last-modified 时间判断，retain_months=0 表示不清理
     pub fn cleanup_expired(&self) -> Result<usize, String> {
         if self.config.retain_months == 0 {
             return Ok(0);
         }
         let cutoff = cutoff_month(self.config.retain_months);
-        let device_dirs = self.client.list(DEVICES_DIR)?;
         let mut removed = 0usize;
-        for d in &device_dirs {
-            if !d.is_dir {
-                continue;
-            }
-            let sub_files = match self.client.list(&d.href) {
+        // 清理两个目录：按文件名无时间信息，改用 last_modified 日期判断
+        for dir in [EVENTS_DIR, TOMBSTONES_DIR] {
+            let files = match self.client.list(dir) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            for f in sub_files {
+            for f in files {
                 if f.is_dir {
                     continue;
                 }
-                // 文件名形如 2026-07.jsonl
-                if let Some(month) = extract_month_from_path(&f.href) {
+                // last_modified 形如 "Mon, 21 Jul 2026 12:00:00 GMT"，取月份判断
+                if let Some(month) = extract_month_from_http_date(&f.last_modified) {
                     if month < cutoff {
                         if self.client.delete(&f.href).is_ok() {
                             removed += 1;
@@ -389,15 +391,6 @@ pub struct PullStats {
     pub deleted: usize,
 }
 
-/// 当前月份字符串：YYYY-MM
-fn current_month() -> String {
-    let now = now_millis();
-    let secs = (now / 1000) as i64;
-    use chrono::{Datelike, TimeZone, Utc};
-    let dt = Utc.timestamp_opt(secs, 0).single().unwrap_or_else(|| Utc::now());
-    format!("{:04}-{:02}", dt.year(), dt.month())
-}
-
 /// N 个月前的月份字符串（用于清理阈值）
 fn cutoff_month(retain_months: usize) -> String {
     let now = now_millis();
@@ -408,20 +401,28 @@ fn cutoff_month(retain_months: usize) -> String {
     format!("{:04}-{:02}", cutoff.year(), cutoff.month())
 }
 
-/// 从路径提取月份：如 devices/pc/2026-07.jsonl -> 2026-07
-fn extract_month_from_path(path: &str) -> Option<String> {
-    let name = path.rsplit('/').next()?;
-    let stem = name.strip_suffix(".jsonl")?;
-    // 校验 YYYY-MM 格式
-    if stem.len() == 7
-        && stem.as_bytes()[4] == b'-'
-        && stem[..4].chars().all(|c| c.is_ascii_digit())
-        && stem[5..].chars().all(|c| c.is_ascii_digit())
-    {
-        Some(stem.to_string())
-    } else {
-        None
+/// 从 HTTP 日期（RFC 2822）提取月份：如 "Mon, 21 Jul 2026 12:00:00 GMT" -> "2026-07"
+fn extract_month_from_http_date(date: &str) -> Option<String> {
+    use chrono::{Datelike, NaiveDate, Utc};
+    // 尝试解析 RFC 2822 格式
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(date) {
+        return Some(format!("{:04}-{:02}", dt.year(), dt.month()));
     }
+    // 兜底：手动解析 "Mon, 21 Jul 2026 ..." 格式
+    let parts: Vec<&str> = date.split_whitespace().collect();
+    if parts.len() >= 4 {
+        let day: u32 = parts[1].parse().ok()?;
+        let month = match parts[2] {
+            "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4, "May" => 5, "Jun" => 6,
+            "Jul" => 7, "Aug" => 8, "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+            _ => return None,
+        };
+        let year: i32 = parts[3].parse().ok()?;
+        let _ = NaiveDate::from_ymd_opt(year, month, day)?; // 校验日期合法
+        let _ = Utc::now();
+        return Some(format!("{:04}-{:02}", year, month));
+    }
+    None
 }
 
 /// 协调器句柄：跨线程共享（Arc + Mutex 保护协调器内部可变状态）

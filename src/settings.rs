@@ -13,8 +13,8 @@ use crate::ui::SettingsWindow;
 use crate::updater::{CheckResult, UpdateInfo};
 use crate::{
     SETTING_HOTKEY, SETTING_MAX_AGE_DAYS, SETTING_MAX_HISTORY, SETTING_SYNC_DEVICE_NAME,
-    SETTING_SYNC_ENABLED, SETTING_SYNC_IMAGE_ENABLED, SETTING_SYNC_PASSWORD,
-    SETTING_SYNC_RETAIN_MONTHS, SETTING_SYNC_URL, SETTING_SYNC_USERNAME,
+    SETTING_SYNC_ENABLED, SETTING_SYNC_IMAGE_ENABLED, SETTING_SYNC_MARKED_ONLY,
+    SETTING_SYNC_PASSWORD, SETTING_SYNC_RETAIN_MONTHS, SETTING_SYNC_URL, SETTING_SYNC_USERNAME,
 };
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -68,6 +68,7 @@ pub fn open(
     window.set_sync_password(SharedString::from(load_sync_password(&storage)));
     window.set_sync_device_name(SharedString::from(load_sync_device_name(&storage)));
     window.set_sync_image_enabled(load_sync_image_enabled(&storage));
+    window.set_sync_marked_only(load_sync_marked_only(&storage));
     window.set_sync_retain_months(SharedString::from(load_sync_retain_months_display(&storage)));
     window.set_sync_status(SharedString::from(""));
     window.set_sync_password_visible(false);
@@ -247,6 +248,10 @@ pub fn open(
         let _ = s.set_setting(
             SETTING_SYNC_IMAGE_ENABLED,
             if w.get_sync_image_enabled() { "1" } else { "0" },
+        );
+        let _ = s.set_setting(
+            SETTING_SYNC_MARKED_ONLY,
+            if w.get_sync_marked_only() { "1" } else { "0" },
         );
         // 保留期：空值按默认 3 处理，避免存入空串
         let retain = w.get_sync_retain_months().to_string();
@@ -607,6 +612,17 @@ pub fn load_sync_image_enabled(storage: &Rc<RefCell<Storage>>) -> bool {
         .flatten()
         .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+/// 仅同步标记内容（默认 true）：减少垃圾数据流量
+pub fn load_sync_marked_only(storage: &Rc<RefCell<Storage>>) -> bool {
+    storage
+        .borrow()
+        .get_setting(SETTING_SYNC_MARKED_ONLY)
+        .ok()
+        .flatten()
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(true) // 默认 true
 }
 
 /// 保留期显示文本（0 显示为空，未设置默认 3）
