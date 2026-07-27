@@ -92,3 +92,64 @@ jobs:
           files: |
             artifacts/**/*-setup.exe
             artifacts/**/*.dmg
+
+  sync-gitee-release:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 下载制品
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 生成提交明细
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..HEAD"
+          else
+            RANGE=$(git rev-list --max-parents=0 HEAD)..HEAD
+          fi
+          {
+            echo "body<<EOF"
+            git log --pretty=format:"- %s (%h)" "$RANGE"
+            echo ""
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 同步 Release 到 Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+          BODY: ${{ steps.changelog.outputs.body }}
+        run: |
+          set -euo pipefail
+          OWNER="ccgod"
+          REPO="CCopy"
+          TAG="${TAG_NAME}"
+          # 创建 Release（若已存在则更新）
+          PAYLOAD=$(jq -n --arg tag "$TAG" --arg name "CCopy $TAG" --arg body "$BODY" \
+            '{tag_name: $tag, name: $name, body: $body, target_commitish: "main"}')
+          CREATE_RESP=$(curl -sS -X POST "https://gitee.com/api/v5/repos/${OWNER}/${REPO}/releases" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" 2>/dev/null || echo "")
+          RELEASE_ID=$(echo "$CREATE_RESP" | jq -r '.id // empty')
+          if [ -z "$RELEASE_ID" ]; then
+            # 已存在则获取现有 Release ID
+            RELEASE_ID=$(curl -sS "https://gitee.com/api/v5/repos/${OWNER}/${REPO}/releases/tags/${TAG}" | jq -r '.id')
+          fi
+          echo "Gitee Release ID: $RELEASE_ID"
+          # 上传所有制品附件
+          find artifacts -type f \( -name "*-setup.exe" -o -name "*.dmg" \) | while read -r FILE; do
+            NAME=$(basename "$FILE")
+            echo "上传附件: $NAME"
+            curl -sS -X POST "https://gitee.com/api/v5/repos/${OWNER}/${REPO}/releases/${RELEASE_ID}/attach_files" \
+              -H "Content-Type: multipart/form-data" \
+              -F "name=${NAME}" \
+              -F "file=@${FILE}" > /dev/null
+          done

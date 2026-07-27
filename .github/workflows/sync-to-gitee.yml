@@ -1,0 +1,23 @@
+name: Sync to Gitee
+
+on:
+  push:
+    branches:
+      - '*'
+    tags:
+      - '*'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 镜像推送至 Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone --mirror "https://github.com/${{ github.repository }}.git" repo
+          cd repo
+          git remote add gitee "https://ccgod:${GITEE_TOKEN}@gitee.com/ccgod/CCopy.git"
+          git push --mirror gitee

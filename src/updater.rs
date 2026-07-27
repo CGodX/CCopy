@@ -1,4 +1,4 @@
-//! 自动更新：通过 GitHub API 检查最新 Release，下载安装包并静默升级
+//! 自动更新：优先 Gitee 检查最新 Release，失败降级 GitHub，下载安装包并静默升级
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -16,7 +16,8 @@ pub struct UpdateInfo {
 }
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const API_URL: &str = "https://api.github.com/repos/CGodX/CCopy/releases/latest";
+const GITEE_API_URL: &str = "https://gitee.com/api/v5/repos/ccgod/CCopy/releases/latest";
+const GITHUB_API_URL: &str = "https://api.github.com/repos/CGodX/CCopy/releases/latest";
 
 /// 检查结果
 pub enum CheckResult {
@@ -26,24 +27,38 @@ pub enum CheckResult {
     Available(UpdateInfo),
 }
 
-/// GitHub Release 接口返回结构（仅取需要的字段）
+/// Release 接口返回结构（Gitee / GitHub 共用必要字段）
 #[derive(Debug, Deserialize)]
-struct GithubRelease {
+struct Release {
     tag_name: String,
     body: String,
-    assets: Vec<GithubAsset>,
+    assets: Vec<Asset>,
 }
 
 #[derive(Debug, Deserialize)]
-struct GithubAsset {
+struct Asset {
     name: String,
     browser_download_url: String,
 }
 
-/// 拉取 GitHub 最新 Release 并与当前版本对比
+/// 优先 Gitee 检查更新，失败降级 GitHub
 pub fn check() -> Result<CheckResult, String> {
-    let body = http_get_text_with_retry(API_URL, 15)?;
-    let release: GithubRelease =
+    match check_from(GITEE_API_URL) {
+        Ok(result) => Ok(result),
+        Err(gitee_err) => {
+            let github_err = match check_from(GITHUB_API_URL) {
+                Ok(result) => return Ok(result),
+                Err(e) => e,
+            };
+            Err(format!("Gitee 失败: {gitee_err}; GitHub 失败: {github_err}"))
+        }
+    }
+}
+
+/// 从指定源拉取最新 Release 并与当前版本对比
+fn check_from(api_url: &str) -> Result<CheckResult, String> {
+    let body = http_get_text_with_retry(api_url, 15)?;
+    let release: Release =
         serde_json::from_str(&body).map_err(|e| format!("解析 Release 信息失败: {e}"))?;
 
     // 版本号去掉 v 前缀
