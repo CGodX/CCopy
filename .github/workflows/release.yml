@@ -132,24 +132,28 @@ jobs:
           OWNER="ccgod"
           REPO="CCopy"
           TAG="${TAG_NAME}"
-          # 创建 Release（若已存在则更新）
+          AUTH="access_token=${GITEE_TOKEN}"
+          # 创建 Release（若已存在则复用）
           PAYLOAD=$(jq -n --arg tag "$TAG" --arg name "CCopy $TAG" --arg body "$BODY" \
             '{tag_name: $tag, name: $name, body: $body, target_commitish: "main"}')
-          CREATE_RESP=$(curl -sS -X POST "https://gitee.com/api/v5/repos/${OWNER}/${REPO}/releases" \
+          CREATE_RESP=$(curl -sS -X POST "https://gitee.com/api/v5/repos/${OWNER}/${REPO}/releases?${AUTH}" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" 2>/dev/null || echo "")
           RELEASE_ID=$(echo "$CREATE_RESP" | jq -r '.id // empty')
           if [ -z "$RELEASE_ID" ]; then
             # 已存在则获取现有 Release ID
-            RELEASE_ID=$(curl -sS "https://gitee.com/api/v5/repos/${OWNER}/${REPO}/releases/tags/${TAG}" | jq -r '.id')
+            RELEASE_ID=$(curl -sS "https://gitee.com/api/v5/repos/${OWNER}/${REPO}/releases/tags/${TAG}?${AUTH}" | jq -r '.id')
+          fi
+          if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
+            echo "获取 Gitee Release ID 失败，创建响应: $CREATE_RESP" >&2
+            exit 1
           fi
           echo "Gitee Release ID: $RELEASE_ID"
-          # 上传所有制品附件
+          # 上传所有制品附件（同名附件覆盖）
           find artifacts -type f \( -name "*-setup.exe" -o -name "*.dmg" \) | while read -r FILE; do
             NAME=$(basename "$FILE")
             echo "上传附件: $NAME"
-            curl -sS -X POST "https://gitee.com/api/v5/repos/${OWNER}/${REPO}/releases/${RELEASE_ID}/attach_files" \
-              -H "Content-Type: multipart/form-data" \
+            curl -sS -X POST "https://gitee.com/api/v5/repos/${OWNER}/${REPO}/releases/${RELEASE_ID}/attach_files?${AUTH}" \
               -F "name=${NAME}" \
               -F "file=@${FILE}" > /dev/null
           done
