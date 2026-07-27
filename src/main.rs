@@ -848,7 +848,7 @@ app.on_search_changed(move |query| {
         let push_timer = Timer::default();
         push_timer.start(
             TimerMode::Repeated,
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
             move || {
                 let coord = match sync_for_push.borrow().as_ref() {
                     Some(c) => c.clone(),

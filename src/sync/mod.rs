@@ -10,7 +10,6 @@ pub mod event;
 pub mod merge;
 pub mod webdav;
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::clipboard_item::{ClipboardItem, ClipboardKind};
@@ -34,8 +33,6 @@ pub struct SyncCoordinator {
     config: SyncConfig,
     client: WebdavClient,
     device_name: String,
-    /// 本地缓存的各设备文件 etag：path -> etag，避免重复下载
-    etag_cache: Arc<Mutex<HashMap<String, String>>>,
     /// 待推送的事件队列：后台线程消费
     pending: Arc<Mutex<Vec<SyncEvent>>>,
     /// 已创建的目录集合：避免重复 MKCOL
@@ -59,7 +56,6 @@ impl SyncCoordinator {
             // device_name 仅作事件元数据（source_device），固定值，用户无需配置
             // 防回环已由 apply_events 的 LWW 策略处理，不依赖 device_name
             device_name: "ccopy".to_string(),
-            etag_cache: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(Vec::new())),
             dir_created: Arc::new(Mutex::new(std::collections::HashSet::new())),
             backoff_until: Arc::new(std::sync::atomic::AtomicI64::new(0)),
@@ -331,41 +327,30 @@ impl SyncCoordinator {
 
     /// 拉取单个目录下所有事件文件：etag 缓存增量下载，防回环跳过本机事件
     fn pull_dir(&self, dir: &str) -> Result<Vec<SyncEvent>, String> {
-        self.ensure_dir_cached(dir)?;
+        // ensure_dir 失败不阻断：目录可能已存在，限流时 MKCOL 报错但 list 可能成功
+        let _ = self.ensure_dir_cached(dir);
         let files = match self.client.list(dir) {
             Ok(v) => v,
-            Err(_) => return Ok(Vec::new()),
+            Err(e) => {
+                // 限流等错误向上传播，触发 backoff，避免持续请求
+                return Err(format!("list {dir} 失败: {e}"));
+            }
         };
         let mut events = Vec::new();
         for f in &files {
             if f.is_dir {
                 continue;
             }
-            // etag 缓存：未变化则跳过
-            let cache_key = f.href.clone();
-            let cached = {
-                let cache = self.etag_cache.lock().map_err(|e| format!("锁失败: {e}"))?;
-                cache.get(&cache_key).cloned()
-            };
-            if let Some(et) = &cached {
-                if !et.is_empty() && et == &f.etag {
-                    continue;
-                }
-            }
+            // 每次都下载：本地可能已删除记录，需重新拉取以恢复
+            // LWW 判断在 apply_events 阶段，此处不跳过
             // 下载文件内容（单条事件）
             let data = match self.client.get(&f.href) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            // 更新 etag 缓存
-            if let Ok(mut cache) = self.etag_cache.lock() {
-                cache.insert(cache_key, f.etag.clone());
-            }
             // 解析：每个文件一条事件
             let text = String::from_utf8_lossy(&data);
             if let Ok(ev) = SyncEvent::from_jsonl(text.trim()) {
-                // 防回环由 apply_events 的 LWW 策略处理：
-                // 本机产生的事件拉回时本地 updated_at 相同，会被跳过
                 events.push(ev);
             }
         }

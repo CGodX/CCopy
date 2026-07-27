@@ -22,7 +22,8 @@ pub struct WebdavResource {
     pub href: String,
     /// 是否为目录（collection）
     pub is_dir: bool,
-    /// etag，可能为空
+    /// etag，可能为空（已不用于增量缓存，保留供调试）
+    #[allow(dead_code)]
     pub etag: String,
     /// 最后修改时间（HTTP 日期格式），可能为空
     #[allow(dead_code)]
@@ -97,6 +98,7 @@ impl WebdavClient {
     }
 
     /// 确保目录存在：逐级 MKCOL，已存在则忽略 405/409
+    /// 503（限流）也忽略：目录可能已存在，后续 list/put 会重试
     pub fn ensure_dir(&self, rel: &str) -> Result<(), String> {
         let parts: Vec<&str> = rel.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
         let mut cur = String::new();
@@ -105,6 +107,9 @@ impl WebdavClient {
             match self.run_no_body("MKCOL", &self.url(&cur), &[]) {
                 Ok(_) => {}
                 Err(e) if e.contains("HTTP 405") || e.contains("HTTP 409") => {}
+                Err(e) if e.contains("HTTP 503") => {
+                    // 限流：目录可能已存在，不阻断，后续操作会重试
+                }
                 Err(e) => return Err(format!("MKCOL {cur} 失败: {e}")),
             }
         }
@@ -230,7 +235,21 @@ fn parse_propfind(xml: &str, base_url: &str) -> Vec<WebdavResource> {
             continue;
         }
         let href_decoded = urldecode(&href);
-        let rel = if href_decoded.starts_with(&base_decoded) {
+        // 提取 base_url 的路径部分（如 https://host/dav/CCopy -> /dav/CCopy）
+        let base_path = if let Some(idx) = base_decoded.find("://") {
+            let after = &base_decoded[idx + 3..];
+            if let Some(slash) = after.find('/') {
+                after[slash..].to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            base_decoded.clone()
+        };
+        // href 可能是 /dav/CCopy/sync/events/xxx.json，去掉 base_path 前缀得到相对路径
+        let rel = if !base_path.is_empty() && href_decoded.starts_with(&base_path) {
+            href_decoded[base_path.len()..].to_string()
+        } else if href_decoded.starts_with(&base_decoded) {
             href_decoded[base_decoded.len()..].to_string()
         } else if href_decoded.starts_with("http") {
             if let Some(idx) = href_decoded.find("://") {
@@ -246,6 +265,7 @@ fn parse_propfind(xml: &str, base_url: &str) -> Vec<WebdavResource> {
         } else {
             href_decoded
         };
+        let rel = rel.trim_start_matches('/').to_string();
         let is_dir = resp_block.contains("<D:collection/>")
             || resp_block.contains("<d:collection/>")
             || resp_block.contains("<collection xmlns=\"DAV:\"/>");
