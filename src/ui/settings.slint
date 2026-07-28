@@ -1047,7 +1047,7 @@ export component SettingsWindow inherits Window {
                             }
 
                             // 仅同步标记内容开关（默认开启，大幅减少流量）
-                            // 仅控制文本类，图片由「同步图片」开关独立控制
+                            // 对所有类型生效：文本和图片都需有备注才同步
                             VerticalLayout {
                                 spacing: 2px;
 
@@ -1093,7 +1093,7 @@ export component SettingsWindow inherits Window {
                                 }
 
                                 Text {
-                                    text: "开启后文本类需有备注才同步，图片不受此限制";
+                                    text: "开启后所有内容（含图片）需有备注才同步";
                                     color: #636366;
                                     font-size: 11px;
                                 }

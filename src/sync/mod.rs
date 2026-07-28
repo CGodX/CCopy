@@ -88,21 +88,23 @@ impl SyncCoordinator {
 
     /// 推送 upsert 事件：生成全量快照入队
     /// 过滤规则（两个开关正交，语义清晰）：
-    /// - 图片类：仅受 image_enabled 控制，与 marked_only 无关
-    ///   （图片本身就是显性内容，不应被「仅标记」挡住）
-    /// - 文本/HTML/RTF 等非图片类：marked_only 开启时需有备注才同步
+    /// - image_enabled：图片是否参与同步的总开关（关则图片永不同步）
+    /// - marked_only：仅同步有备注的内容（对所有类型生效）
+    /// 组合：
+    ///   图片 + image_enabled=off  -> 不同步
+    ///   图片 + marked_only=on     -> 需有备注才同步
+    ///   图片 + marked_only=off    -> 全部图片同步
+    ///   非图片 + marked_only=on   -> 需有备注才同步
+    ///   非图片 + marked_only=off  -> 全部同步
     pub fn push_upsert(&self, item: &ClipboardItem) {
         let is_image = matches!(item.kind, ClipboardKind::Image);
-        if is_image {
-            // 图片：只看 image_enabled
-            if !self.config.image_enabled {
-                return;
-            }
-        } else {
-            // 非图片：marked_only 开启时需有备注
-            if self.config.marked_only && item.note.is_none() {
-                return;
-            }
+        // 图片总开关：关则图片永不同步
+        if is_image && !self.config.image_enabled {
+            return;
+        }
+        // marked_only 对所有类型生效：开启时需有备注
+        if self.config.marked_only && item.note.is_none() {
+            return;
         }
         let event = SyncEvent::from_item(item, &self.device_name);
         if let Ok(mut q) = self.pending.lock() {
@@ -129,11 +131,15 @@ impl SyncCoordinator {
             .into_iter()
             .filter(|item| {
                 let is_image = matches!(item.kind, ClipboardKind::Image);
-                if is_image {
-                    self.config.image_enabled
-                } else {
-                    !self.config.marked_only || item.note.is_some()
+                // 图片总开关
+                if is_image && !self.config.image_enabled {
+                    return false;
                 }
+                // marked_only 对所有类型生效
+                if self.config.marked_only && item.note.is_none() {
+                    return false;
+                }
+                true
             })
             .collect()
     }
