@@ -1,4 +1,4 @@
-import { ScrollView } from "std-widgets.slint";
+import { ListView } from "std-widgets.slint";
 import { SettingsWindow } from "settings.slint";
 
 // 重新导出设置窗口组件，使其在生成代码中可用
@@ -368,15 +368,15 @@ export component MainWindow inherits Window {
             }
 
             // 历史记录列表
-            history_view := ScrollView {
+            history_view := ListView {
                 viewport-width: 368px;
                 viewport-y <=> root.viewport-y;
 
-                VerticalLayout {
+                for item[index] in root.history: Rectangle {
                     width: 368px;
-                    spacing: 8px;
-
-                    for item[index] in root.history: Rectangle {
+                    height: item.has_thumbnail ? 158px : 93px;
+                    Rectangle {
+                        width: parent.width;
                         height: item.has_thumbnail ? 150px : 85px;
                         border-radius: 12px;
                         // 苹果风格：用微妙边框代替纯色块

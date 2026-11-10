@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::io::Read;
 use std::rc::Rc;
 
 use clipboard_rs::common::{RustImage, RustImageData};
@@ -7,8 +8,41 @@ use slint::{SharedString, VecModel};
 use crate::clipboard_item::{ClipboardItem, ClipboardKind};
 use crate::ui::HistoryItem;
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn png_dimensions_reads_header_without_decoding_pixels() {
+        let mut header = [0u8; 24];
+        header[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        header[8..12].copy_from_slice(&13u32.to_be_bytes());
+        header[12..16].copy_from_slice(b"IHDR");
+        header[16..20].copy_from_slice(&3840u32.to_be_bytes());
+        header[20..24].copy_from_slice(&2160u32.to_be_bytes());
+        assert_eq!(super::png_dimensions(&header), Some((3840, 2160)));
+        assert_eq!(super::png_dimensions(&header[..23]), None);
+        header[0] = 0;
+        assert_eq!(super::png_dimensions(&header), None);
+    }
+}
+
 /// 缩略图最大边长上限：原图最大边超过此值才缩放，否则保留原尺寸避免放大失真
 const THUMB_MAX: u32 = 300;
+
+fn png_dimensions(header: &[u8]) -> Option<(u32, u32)> {
+    if header.len() < 24 || &header[..8] != b"\x89PNG\r\n\x1a\n"
+        || header[8..12] != 13u32.to_be_bytes() || &header[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes(header[16..20].try_into().ok()?);
+    let h = u32::from_be_bytes(header[20..24].try_into().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let mut header = [0; 24];
+    std::fs::File::open(path).ok()?.read_exact(&mut header).ok()?;
+    png_dimensions(&header)
+}
 
 /// 计算缩略图文件路径：与源文件同目录，命名为 `{stem}.thumb.png`
 pub fn thumbnail_path(data_dir: &Path, blob_path: &str) -> Option<PathBuf> {
@@ -34,6 +68,14 @@ pub fn ensure_thumbnail(data_dir: &Path, blob_path: &str) {
         return;
     };
     let full_blob = data_dir.join(blob_path);
+    // 自有图片均为 PNG。只读文件头，避免反复解码完整原图。
+    if let (Some((sw, sh)), Some((tw, th))) =
+        (image_dimensions(&full_blob), image_dimensions(&thumb_path))
+    {
+        if tw.max(th) == sw.max(sh).min(THUMB_MAX) {
+            return;
+        }
+    }
     let Ok(src) = RustImageData::from_path(full_blob.to_string_lossy().as_ref()) else {
         return;
     };

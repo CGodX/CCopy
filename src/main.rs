@@ -139,9 +139,30 @@ fn main() {
 
     // 异步缩略图加载：后台线程只做磁盘 IO（ensure_thumbnail），就绪后回传 id，
     // 解码成 slint::Image 必须在主线程（slint::Image 非 Send）。
-    // 用取消令牌避免旧批次（切换分类/搜索）的结果覆盖新批次
-    let thumb_cancel: Arc<std::sync::atomic::AtomicBool> = Arc::new(false.into());
-    let (thumb_tx, thumb_rx) = mpsc::channel::<(i32, String)>();
+    // 单工作线程限制解码并发；批次号使重载前的任务永久失效。
+    let thumb_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (thumb_tx, thumb_rx) = mpsc::sync_channel::<(u64, i32, String)>(16);
+    let (thumb_job_tx, thumb_job_rx) = mpsc::channel::<(u64, Vec<(i32, String)>)>();
+    {
+        let generation = thumb_generation.clone();
+        std::thread::spawn(move || {
+            let data_dir = crate::storage::data_dir();
+            while let Ok((batch, pending)) = thumb_job_rx.recv() {
+                for (id, path) in pending {
+                    if generation.load(std::sync::atomic::Ordering::SeqCst) != batch {
+                        break;
+                    }
+                    ensure_thumbnail(&data_dir, &path);
+                    if generation.load(std::sync::atomic::Ordering::SeqCst) != batch {
+                        break;
+                    }
+                    if thumb_tx.send((batch, id, path)).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
     let thumb_rx = Rc::new(RefCell::new(thumb_rx));
     let history_model_for_thumb = history_model.clone();
     let app_weak_for_thumb = app.as_weak();
@@ -150,33 +171,44 @@ fn main() {
         let thumb_rx = thumb_rx.clone();
         let history_model_for_thumb = history_model_for_thumb.clone();
         let app_weak_for_thumb = app_weak_for_thumb.clone();
+        let generation = thumb_generation.clone();
+        let last_view = Cell::new(None);
         thumb_timer.start(TimerMode::Repeated, std::time::Duration::from_millis(50), move || {
-            // 一次性取出当前所有就绪 id，批量解码后统一写入，减少重绘
-            let mut ready = Vec::new();
-            while let Ok(pair) = thumb_rx.borrow().try_recv() {
-                ready.push(pair);
-            }
-            if ready.is_empty() {
-                return;
+            let batch = generation.load(std::sync::atomic::Ordering::SeqCst);
+            let mut changed = false;
+            while let Ok((ready_batch, _, _)) = thumb_rx.borrow().try_recv() {
+                changed |= ready_batch == batch;
             }
             let Some(app) = app_weak_for_thumb.upgrade() else { return };
-            let data_dir = crate::storage::data_dir();
-            // 构建 id->index 映射，避免每张图都全表线性查找
             let model = app.get_history();
-            let mut idx_map: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
-            for i in 0..model.row_count() {
-                if let Some(row) = model.row_data(i) {
-                    idx_map.insert(row.id, i);
-                }
+            let visible = app.window().is_visible();
+            let top = -app.get_viewport_y();
+            let height = app.get_visible_height();
+            let view = (top.to_bits(), height.to_bits(), model.row_count(), batch, visible);
+            if !changed && last_view.get() == Some(view) {
+                return;
             }
-            for (id, blob_path) in ready {
-                let Some(&idx) = idx_map.get(&id) else { continue };
-                let Some(thumb_path) = thumbnail_path(&data_dir, &blob_path) else { continue };
-                // 主线程解码缩略图并写入对应行
-                if let Ok(img) = slint::Image::load_from_path(&thumb_path) {
-                    if let Some(mut row) = model.row_data(idx) {
-                        row.thumbnail = img;
-                        let _ = history_model_for_thumb.set_row_data(idx, row);
+            last_view.set(Some(view));
+            let data_dir = crate::storage::data_dir();
+            let mut y = 0.0;
+            // 只保留可视区域及上下各一屏的图片；滚出后释放 model 对图片的引用。
+            for idx in 0..model.row_count() {
+                let Some(mut row) = model.row_data(idx) else { continue };
+                let row_height = if row.has_thumbnail { 150.0 } else { 85.0 };
+                let near_view = visible && y + row_height >= top - height && y <= top + height * 2.0;
+                y += row_height + 8.0;
+                if !row.has_thumbnail { continue; }
+                if !near_view {
+                    if row.thumbnail.size().width > 0 {
+                        row.thumbnail = slint::Image::default();
+                        history_model_for_thumb.set_row_data(idx, row);
+                    }
+                } else if row.thumbnail.size().width == 0 {
+                    if let Some(path) = thumbnail_path(&data_dir, row.blob_path.as_str()) {
+                        if let Ok(img) = slint::Image::load_from_path(&path) {
+                            row.thumbnail = img;
+                            history_model_for_thumb.set_row_data(idx, row);
+                        }
                     }
                 }
             }
@@ -184,32 +216,17 @@ fn main() {
     }
     std::mem::forget(thumb_timer);
 
-    let load_thumbnails_fn: Rc<dyn Fn(Vec<(i32, String)>)> = Rc::new({
-        let thumb_cancel = thumb_cancel.clone();
-        let thumb_tx = thumb_tx.clone();
-        move |pending: Vec<(i32, String)>| {
-            if pending.is_empty() {
-                return;
+    let load_thumbnails_fn: Rc<dyn Fn(Vec<(i32, String)>, bool)> = Rc::new({
+        let generation = thumb_generation.clone();
+        move |pending: Vec<(i32, String)>, reset: bool| {
+            // 重载时永久淘汰旧批次；翻页追加沿用当前批次，避免丢失前页任务。
+            if reset {
+                generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            // 取消上一批次：翻转令牌，旧线程检测到即退出
-            thumb_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-            let cancelled = thumb_cancel.clone();
-            thumb_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
-            let tx = thumb_tx.clone();
-            let data_dir = crate::storage::data_dir();
-            std::thread::spawn(move || {
-                for (id, blob_path) in pending {
-                    if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-                        return;
-                    }
-                    ensure_thumbnail(&data_dir, &blob_path);
-                    if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-                        return;
-                    }
-                    // 只回传 id 与 blob_path，解码留在主线程
-                    let _ = tx.send((id, blob_path));
-                }
-            });
+            if !pending.is_empty() {
+                let batch = generation.load(std::sync::atomic::Ordering::SeqCst);
+                let _ = thumb_job_tx.send((batch, pending));
+            }
         }
     });
 
@@ -219,7 +236,7 @@ fn main() {
             let pending = fill_model(&history_model, &items);
             loaded_count.set(items.len());
             has_more.set(items.len() == PAGE_SIZE);
-            load_thumbnails_fn.clone()(pending);
+            load_thumbnails_fn.clone()(pending, true);
         }
     }
 
@@ -265,7 +282,7 @@ let reload_history: Rc<dyn Fn()> = Rc::new({
             has_more.set(items.len() == PAGE_SIZE);
             // app 仍存活才回填缩略图
             if app_weak.upgrade().is_some() {
-                load_thumbs(pending);
+                load_thumbs(pending, true);
             }
         }
     }
@@ -717,7 +734,7 @@ app.on_search_changed(move |query| {
             loaded_count_for_more.set(new_count);
             has_more_for_more.set(items.len() == PAGE_SIZE);
             // 仅追加页的缩略图进后台队列，不影响已加载项
-            load_thumbs_for_more(pending);
+            load_thumbs_for_more(pending, false);
         }
         loading_for_more.set(false);
     });

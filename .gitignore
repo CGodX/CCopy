@@ -2,6 +2,7 @@
 /release
 .claude
 .code-review-graph
+.codegraph/
 .learnings
 .omc
 .workbuddy
